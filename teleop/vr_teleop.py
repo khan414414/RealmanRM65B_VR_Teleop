@@ -1,10 +1,9 @@
 import socket
 import numpy as np
 
-from UR10_RTDE.rtde.rtde import RTDE
 from teleop.gripper_request import GripperRequest
 from teleop.vr_tracker import VRTracker
-
+from Realman_Control.realman_control import RM65B
 
 def main():
     # Create a TCP socket to listen to Unity
@@ -16,7 +15,8 @@ def main():
     print("Connected to Unity server")
 
     # Initialize the teleoperation class
-    rtde = RTDE("192.168.1.102")
+    #rtde = RTDE("192.168.1.102")
+    rtde = RM65B("192.168.1.18", port=8080)
     # Initialize the gripper class
     gripper = GripperRequest("130.215.216.42")
     # Teleop control
