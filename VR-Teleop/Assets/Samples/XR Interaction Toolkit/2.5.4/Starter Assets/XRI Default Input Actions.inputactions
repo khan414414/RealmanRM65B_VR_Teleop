@@ -1300,7 +1300,7 @@
                 {
                     "name": "first",
                     "id": "9717e367-64a4-440a-9974-1e641d753eb2",
-                    "path": "<XRController>{RightHand}/pointerPosition",
+                    "path": "<XRController>{RightHand}/devicePosition",
                     "interactions": "",
                     "processors": "",
                     "groups": "Generic XR Controller",
@@ -1311,7 +1311,7 @@
                 {
                     "name": "second",
                     "id": "0794a41d-29ef-48ec-a452-6b7de29b52fa",
-                    "path": "<XRController>{RightHand}/devicePosition",
+                    "path": "<XRController>{RightHand}/pointerPosition",
                     "interactions": "",
                     "processors": "",
                     "groups": "Generic XR Controller",

@@ -57,8 +57,8 @@ class RealmanControl:
 
     JOINT_COUNT = 6
     DEFAULT_PORT = 8080
-    MAX_LINEAR_SPEED = 0.250
-    MAX_ANGULAR_SPEED = 0.600
+    MAX_LINEAR_SPEED = 0.6
+    MAX_ANGULAR_SPEED = 1.2
     # Limits from the supplied RM65-B/urdf/RM65-B.urdf reference, in radians.
     JOINT_LIMITS = (
         (-3.1060, 3.1060),
@@ -100,6 +100,7 @@ class RealmanControl:
         )
         self._closed = False
         self._velocity_stream_config: Optional[tuple[int, int, int]] = None
+        self._joint_limits = tuple(self.JOINT_LIMITS)
 
         handle_id = getattr(self._handle, "id", -1)
         if handle_id < 0:
@@ -147,12 +148,13 @@ class RealmanControl:
             raise ValueError("blend_percent must be in the range 0..100")
         return result
 
-    @classmethod
     def _joint_targets(
-        cls, values: Sequence[float], name: str = "joint_values"
+        self, values: Sequence[float], name: str = "joint_values"
     ) -> list[float]:
-        joints = cls._vector(values, cls.JOINT_COUNT, name)
-        for index, (value, limits) in enumerate(zip(joints, cls.JOINT_LIMITS), 1):
+        joints = self._vector(values, self.JOINT_COUNT, name)
+        for index, (value, limits) in enumerate(
+            zip(joints, self._joint_limits), 1
+        ):
             lower, upper = limits
             if not lower <= value <= upper:
                 raise ValueError(
@@ -245,6 +247,39 @@ class RealmanControl:
         joints = self._vector(joint_degrees, self.JOINT_COUNT, "joint state")
         return [math.radians(value) for value in joints]
 
+    def get_joint_limits(self) -> tuple[tuple[float, float], ...]:
+        """Read and cache the controller's configured joint position limits.
+
+        These are the software limits shown/configured through the RealMan
+        teach pendant.  API2 returns degrees; the wrapper exposes radians.
+        Subsequent motion validation uses this cached controller value rather
+        than the model fallback in :attr:`JOINT_LIMITS`.
+        """
+
+        self._require_open()
+        min_code, minimum_degrees = self._arm.rm_get_joint_min_pos()
+        self._check_code(min_code, "rm_get_joint_min_pos")
+        max_code, maximum_degrees = self._arm.rm_get_joint_max_pos()
+        self._check_code(max_code, "rm_get_joint_max_pos")
+        minimum = self._vector(
+            minimum_degrees, self.JOINT_COUNT, "controller joint minimums"
+        )
+        maximum = self._vector(
+            maximum_degrees, self.JOINT_COUNT, "controller joint maximums"
+        )
+        limits = tuple(
+            (math.radians(lower), math.radians(upper))
+            for lower, upper in zip(minimum, maximum)
+        )
+        for index, (lower, upper) in enumerate(limits, 1):
+            if lower >= upper:
+                raise RuntimeError(
+                    f"controller returned invalid limits for J{index}: "
+                    f"{minimum[index - 1]:.3f}..{maximum[index - 1]:.3f} deg"
+                )
+        self._joint_limits = limits
+        return tuple(limits)
+
     def get_joint_speed(self) -> list[float]:
         """Explain why synchronous API2 cannot provide joint velocity here."""
 
@@ -263,6 +298,77 @@ class RealmanControl:
         if not isinstance(state, dict) or "pose" not in state:
             raise RuntimeError("rm_get_current_arm_state returned no pose")
         return self._from_realman_pose(state["pose"])
+
+    def get_active_tool_frame_pose_euler(self) -> list[float]:
+        """Return the active flange-to-TCP offset as XYZ plus XYZ Euler angles.
+
+        This deliberately preserves RealMan's native Euler convention because
+        the decoupled RM65 kinematics uses it to construct a TCP transform.
+        Position is in metres and angles are in radians.
+        """
+
+        self._require_open()
+        code, frame = self._arm.rm_get_current_tool_frame()
+        self._check_code(code, "rm_get_current_tool_frame")
+        if not isinstance(frame, dict) or "pose" not in frame:
+            raise RuntimeError("rm_get_current_tool_frame returned no pose")
+        return self._vector(frame["pose"], 6, "active tool frame pose")
+
+    def validate_joint_target(
+        self,
+        joint_values: Sequence[float],
+        *,
+        singular_value_limit: float = 0.01,
+        check_self_collision: bool = True,
+    ) -> int:
+        """Reject joint targets that are singular, out of range or self-colliding.
+
+        This is a read-only algorithm-layer check; it does not send a motion
+        command.  Joint input uses the wrapper's public radians convention.
+        """
+
+        self._require_open()
+        joints = self._joint_targets(joint_values)
+        threshold = float(singular_value_limit)
+        if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
+            raise ValueError("singular_value_limit must be in (0, 1)")
+        joint_degrees = [math.degrees(value) for value in joints]
+
+        singular = int(
+            self._arm.rm_algo_universal_singularity_analyse(
+                joint_degrees, threshold
+            )
+        )
+        if singular == -1:
+            kind, distance = self._arm.rm_algo_kin_robot_singularity_analyse(
+                joint_degrees
+            )
+            labels = {-1: "shoulder", -2: "elbow", -3: "wrist"}
+            label = labels.get(int(kind), "Jacobian")
+            raise ValueError(
+                f"joint target is near a {label} singularity "
+                f"(shoulder distance {float(distance):.4f} m)"
+            )
+        if singular != 0:
+            raise RuntimeError(
+                "rm_algo_universal_singularity_analyse failed with "
+                f"code {singular}"
+            )
+
+        if check_self_collision:
+            collision = int(
+                self._arm.rm_algo_safety_robot_self_collision_detection(
+                    joint_degrees
+                )
+            )
+            if collision == 1:
+                raise ValueError("joint target is self-colliding")
+            if collision != 0:
+                raise RuntimeError(
+                    "rm_algo_safety_robot_self_collision_detection failed with "
+                    f"code {collision}"
+                )
+        return 0
 
     def get_tool_speed(self) -> list[float]:
         """Report that API2 has no equivalent synchronous TCP-speed query."""

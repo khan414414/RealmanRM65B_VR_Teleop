@@ -1845,7 +1845,6 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   ipAddress: 127.0.0.1
   port: 5555
-  publishFrameRate: 100
   controller: {fileID: 1460838194}
   trackingButton:
     m_UseReference: 1
@@ -1859,18 +1858,6 @@ MonoBehaviour:
       m_SingletonActionBindings: []
       m_Flags: 0
     m_Reference: {fileID: 83097790271614945, guid: c348712bda248c246b8c49b3db54643f, type: 3}
-  gripperButton:
-    m_UseReference: 1
-    m_Action:
-      m_Name: Gripper Button
-      m_Type: 0
-      m_ExpectedControlType: 
-      m_Id: d28131af-752b-4a4c-9740-a7041396856d
-      m_Processors: 
-      m_Interactions: 
-      m_SingletonActionBindings: []
-      m_Flags: 0
-    m_Reference: {fileID: 187161793506945269, guid: c348712bda248c246b8c49b3db54643f, type: 3}
 --- !u!1 &1969298595
 GameObject:
   m_ObjectHideFlags: 0

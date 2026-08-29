@@ -1,4 +1,5 @@
 using System;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -9,26 +10,23 @@ public class VRControllerSender : MonoBehaviour
 {
     [SerializeField] private string ipAddress = "127.0.0.1";
     [SerializeField] private int port = 5555;
-    [SerializeField] private int  publishFrameRate= 100;
-    private float lastUpdateTime = 0f;
-    private float targetInterval = 0f;
 
     [SerializeField] private GameObject controller;
     [SerializeField] private InputActionProperty trackingButton;
-    [SerializeField] private InputActionProperty gripperButton;
-    private bool trackingButtonTriggered = false;
-    private bool gripperButtonTriggered = false;
 
     private TcpListener server;
     private TcpClient client;
     private NetworkStream stream;
 
     private bool isAwaitingConnection = false; // Track if waiting for a connection
+    private long sequenceId = 0;
+    private int samplesInRateWindow = 0;
+    private double rateWindowStartedAt = 0.0;
 
     void Start()
     {
         StartServer();
-        targetInterval = 1f / publishFrameRate;
+        rateWindowStartedAt = Time.realtimeSinceStartupAsDouble;
     }
 
     void StartServer()
@@ -64,7 +62,10 @@ public class VRControllerSender : MonoBehaviour
         try
         {
             client = server.EndAcceptTcpClient(ar);
+            client.NoDelay = true;
             stream = client.GetStream();
+            samplesInRateWindow = 0;
+            rateWindowStartedAt = 0.0;
             Debug.Log("Client connected!");
         }
         catch (ObjectDisposedException)
@@ -78,17 +79,8 @@ public class VRControllerSender : MonoBehaviour
         }
     }
 
-    void OnEnable()
-    {
-        trackingButton.action.performed += ctx => trackingButtonTriggered = true;
-        gripperButton.action.performed += ctx => gripperButtonTriggered = true;
-    }
-
     void OnDisable()
     {
-        trackingButton.action.performed -= ctx => trackingButtonTriggered = true;
-        gripperButton.action.performed -= ctx => gripperButtonTriggered = true;
-
         stream?.Close();
         client?.Close();
         server?.Stop();
@@ -106,11 +98,11 @@ public class VRControllerSender : MonoBehaviour
             WaitForClientConnection();
             return;
         }
-        if (Time.time - lastUpdateTime < targetInterval)
-            return;
-        lastUpdateTime = Time.time;
-
-        // Get controller position and rotation
+        // Send exactly one sample for each Unity/XR Dynamic Update.  The old
+        // 10 ms gate aliased a 120 Hz Meta stream down to roughly 60 Hz and
+        // therefore did not produce the advertised 100 Hz.  A sequence ID and
+        // monotonic Unity timestamp let Python resample these native XR frames
+        // onto the robot's fixed-rate command clock without guessing.
         // Convert to regular coordinate from Unity coordinate
         Vector3 position = controller.transform.position;
         Quaternion rotation = controller.transform.rotation;
@@ -118,18 +110,42 @@ public class VRControllerSender : MonoBehaviour
         rotation = new Quaternion(rotation.z, -rotation.x, rotation.y, -rotation.w);
 
         // Get button states
-        bool button1 = trackingButtonTriggered;
-        bool button2 = gripperButtonTriggered;
+        // Send the Trigger's held state so tracking is active only while pressed.
+        bool button1 = trackingButton.action?.IsPressed() ?? false;
+        // Keep the ninth protocol field for compatibility, but disable right-hand Grip.
+        const bool button2 = false;
 
-        // Create data string: x, y, z, qx, qy, qz, qw, button1, button2
-        string FormatFloat(float value) => value.ToString("F3");
-        string data = $"{FormatFloat(position.x)},{FormatFloat(position.y)},{FormatFloat(position.z)},{FormatFloat(rotation.x)},{FormatFloat(rotation.y)},{FormatFloat(rotation.z)},{FormatFloat(rotation.w)},{(button1 ? 1 : 0)},{(button2 ? 1 : 0)}\n";
+        long currentSequence = sequenceId++;
+        double sampleTime = Time.realtimeSinceStartupAsDouble;
+        if (rateWindowStartedAt <= 0.0)
+            rateWindowStartedAt = sampleTime;
+        string FormatFloat(float value) =>
+            value.ToString("F6", CultureInfo.InvariantCulture);
+        string sampleTimeText =
+            sampleTime.ToString("F6", CultureInfo.InvariantCulture);
+        string data =
+            $"{FormatFloat(position.x)},{FormatFloat(position.y)}," +
+            $"{FormatFloat(position.z)},{FormatFloat(rotation.x)}," +
+            $"{FormatFloat(rotation.y)},{FormatFloat(rotation.z)}," +
+            $"{FormatFloat(rotation.w)},{(button1 ? 1 : 0)}," +
+            $"{(button2 ? 1 : 0)},{currentSequence}," +
+            $"{sampleTimeText}\n";
 
         try
         {
             // Send data to the Python server
             byte[] message = Encoding.UTF8.GetBytes(data);
             stream.Write(message, 0, message.Length);
+            samplesInRateWindow++;
+            double elapsed = sampleTime - rateWindowStartedAt;
+            if (elapsed >= 3.0)
+            {
+                Debug.Log(
+                    $"Meta/Unity controller stream: " +
+                    $"{(samplesInRateWindow / elapsed):F1} Hz");
+                samplesInRateWindow = 0;
+                rateWindowStartedAt = sampleTime;
+            }
         }
         catch (Exception e)
         {
@@ -139,8 +155,5 @@ public class VRControllerSender : MonoBehaviour
             WaitForClientConnection();
         }
 
-        // Reset button states
-        trackingButtonTriggered = false;
-        gripperButtonTriggered = false;
     }
 }
