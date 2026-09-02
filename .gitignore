@@ -18,5 +18,5 @@ __pycache__/
 *.pyc
 
 # Runtime VR calibration (machine/room specific)
-config/vr_position_calibration.json
-config/vr_position_calibration.json.tmp
+config/aubo_i7_vr_position_calibration.json
+config/aubo_i7_vr_position_calibration.json.tmp

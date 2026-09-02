@@ -1,6 +1,8 @@
-"""Offline RM65-B kinematics and position-only, roll-decoupled IK.
+"""Offline AUBO i7 kinematics and position-only, roll-decoupled IK.
 
-The kinematic constants in this module follow ``RM65-B/urdf/RM65-B.urdf``.
+The nominal kinematic constants in this module follow AUBO's official
+``aubo_description/urdf/aubo_i7_30.urdf``.  They intentionally model the
+flange geometry only; the active controller TCP is composed at runtime.
 Joints 1..5 solve only the TCP position task.  Joint 6 is held at a separately
 provided wrist-roll target and is never used by the position pseudoinverse.
 
@@ -9,10 +11,12 @@ to change TCP orientation while reaching XYZ.  Also, an off-axis active tool
 offset makes J6 affect TCP position; in that case J1..5 compensate for the
 chosen J6 angle rather than treating its motion as position-neutral.
 
-The companion SolidWorks CSV describes joint 6 with the opposite axis sign,
-while the URDF and RealMan API2 forward kinematics agree on +Z.  This module
-follows the URDF/API2 convention.  The controller-to-J6 ``roll_sign`` remains a
-separate input-device calibration and must be checked at low speed.
+All six URDF joints rotate about local +Z.  The controller-to-J6 ``roll_sign``
+remains a separate input-device calibration and must be checked at low speed.
+
+The generic/i7_30 URDF permits +/-360 degrees, while older i7_10 and i7_11
+hardware has narrower limits.  Callers must prefer limits read from
+``RobotConfig`` over :data:`AUBO_I7_JOINT_LIMITS_RAD`.
 """
 
 from __future__ import annotations
@@ -24,39 +28,39 @@ from typing import Optional, Sequence
 import numpy as np
 
 
-RM65_JOINT_LIMITS_RAD: tuple[tuple[float, float], ...] = (
-    (-3.1060, 3.1060),
-    (-2.2689, 2.2689),
-    (-2.3560, 2.3560),
-    (-3.1060, 3.1060),
-    (-2.2340, 2.2340),
-    (-6.2800, 6.2800),
+AUBO_I7_JOINT_LIMITS_RAD: tuple[tuple[float, float], ...] = (
+    (-2.0 * math.pi, 2.0 * math.pi),
+    (-2.0 * math.pi, 2.0 * math.pi),
+    (-2.0 * math.pi, 2.0 * math.pi),
+    (-2.0 * math.pi, 2.0 * math.pi),
+    (-2.0 * math.pi, 2.0 * math.pi),
+    (-2.0 * math.pi, 2.0 * math.pi),
 )
 
 # A bent, non-singular posture that can be supplied explicitly as a secondary
 # objective.  It is not imposed automatically because collision-free posture
 # depends on the physical cell and active tool.
-RM65_NOMINAL_POSTURE_RAD: tuple[float, ...] = tuple(
-    math.radians(value) for value in (0.0, -75.0, 60.0, 0.0, 60.0, 0.0)
+AUBO_I7_NOMINAL_POSTURE_RAD: tuple[float, ...] = tuple(
+    math.radians(value) for value in (0.0, -60.0, -75.0, 0.0, -75.0, 0.0)
 )
 
 _JOINT_ORIGIN_XYZ = np.asarray(
     (
-        (0.0, 0.0, 0.2405),
-        (0.0, 0.0, 0.0),
-        (0.256, 0.0, 0.0),
-        (0.0, -0.210, 0.0),
-        (0.0, 0.0, 0.0),
-        (0.0, -0.144, 0.0),
+        (0.0, 0.0, 0.122),
+        (0.0, 0.1215, 0.0),
+        (0.368, 0.0, 0.0),
+        (0.316, 0.0, 0.0),
+        (0.0, 0.1025, 0.0),
+        (0.0, -0.094, 0.0),
     ),
     dtype=np.float64,
 )
 _JOINT_ORIGIN_RPY = np.asarray(
     (
-        (0.0, 0.0, 0.0),
-        (math.pi / 2.0, -math.pi / 2.0, 0.0),
-        (0.0, 0.0, math.pi / 2.0),
-        (math.pi / 2.0, 0.0, 0.0),
+        (0.0, 0.0, math.pi),
+        (-math.pi / 2.0, -math.pi / 2.0, 0.0),
+        (-math.pi, 0.0, 0.0),
+        (math.pi, 0.0, math.pi / 2.0),
         (-math.pi / 2.0, 0.0, 0.0),
         (math.pi / 2.0, 0.0, 0.0),
     ),
@@ -78,7 +82,7 @@ def _joint_limits(
     value: Optional[Sequence[Sequence[float]]],
 ) -> np.ndarray:
     if value is None:
-        result = np.asarray(RM65_JOINT_LIMITS_RAD, dtype=np.float64)
+        result = np.asarray(AUBO_I7_JOINT_LIMITS_RAD, dtype=np.float64)
     else:
         result = np.asarray(value, dtype=np.float64)
     if result.shape != (6, 2) or not np.all(np.isfinite(result)):
@@ -117,20 +121,6 @@ def _rpy_matrix(rpy: np.ndarray) -> np.ndarray:
     return rz @ ry @ rx
 
 
-def transform_from_xyz_euler(pose: Sequence[float]) -> np.ndarray:
-    """Build a homogeneous transform from ``[x, y, z, rx, ry, rz]``.
-
-    RealMan tool-frame offsets use metres and fixed-axis XYZ Euler angles, the
-    same convention used by URDF ``rpy`` origins.
-    """
-
-    value = _vector(pose, 6, "pose")
-    result = np.eye(4, dtype=np.float64)
-    result[:3, :3] = _rpy_matrix(value[3:])
-    result[:3, 3] = value[:3]
-    return result
-
-
 def _axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     axis = axis / np.linalg.norm(axis)
     x, y, z = axis
@@ -139,6 +129,23 @@ def _axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     return identity + math.sin(angle) * skew + (1.0 - math.cos(angle)) * (
         skew @ skew
     )
+
+
+def transform_from_xyz_rotvec(pose: Sequence[float]) -> np.ndarray:
+    """Build a transform from an AUBO ``[x, y, z, rx, ry, rz]`` pose.
+
+    Position is expressed in metres.  The final three values are a rotation
+    vector in radians, matching ``RobotConfig.getTcpOffset()`` and
+    ``RobotState.getTcpPose()`` in the ARCS SDK.
+    """
+
+    value = _vector(pose, 6, "pose")
+    result = np.eye(4, dtype=np.float64)
+    angle = float(np.linalg.norm(value[3:]))
+    if angle > 1.0e-12:
+        result[:3, :3] = _axis_angle_matrix(value[3:] / angle, angle)
+    result[:3, 3] = value[:3]
+    return result
 
 
 def _joint_frames(
@@ -174,6 +181,24 @@ def forward_kinematics(
 
     link_6, _, _ = _joint_frames(joints_rad)
     return link_6 @ _transform(tcp_transform)
+
+
+def collision_key_points(
+    joints_rad: Sequence[float],
+    tcp_transform: Optional[Sequence[Sequence[float]]] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return joint origins, flange-face point and active TCP in base metres.
+
+    The flange-face offset matches the simplified i7_30 visual geometry.  The
+    points are intended for conservative capsule collision checks, not mesh
+    rendering.
+    """
+
+    link_6, origins, _ = _joint_frames(joints_rad)
+    flange_face_local = np.asarray((0.0, 0.0, 0.073, 1.0))
+    flange_face = (link_6 @ flange_face_local)[:3]
+    tcp_position = (link_6 @ _transform(tcp_transform))[:3, 3]
+    return origins.copy(), flange_face, tcp_position.copy()
 
 
 def geometric_jacobian(
@@ -331,7 +356,7 @@ class ContinuousControllerTwist:
 def nearest_equivalent_angle_within_limits(
     angle_rad: float,
     reference_rad: float,
-    limits_rad: tuple[float, float] = RM65_JOINT_LIMITS_RAD[5],
+    limits_rad: tuple[float, float] = AUBO_I7_JOINT_LIMITS_RAD[5],
 ) -> float:
     """Choose the in-limit 2*pi equivalent closest to the previous command."""
 
@@ -350,8 +375,7 @@ def nearest_equivalent_angle_within_limits(
         nearest_turn = min(max(nearest_turn, turns_low), turns_high)
         return angle + 2.0 * math.pi * nearest_turn
 
-    # The RM65 J6 interval is fractionally narrower than two complete turns at
-    # each side.  A requested equivalence can therefore fall in a tiny gap.
+    # A controller may report a range narrower than one full equivalence.
     return min(max(unwrap_angle_near(angle, reference), lower), upper)
 
 
@@ -362,7 +386,7 @@ def continuous_wrist_roll_target(
     *,
     roll_sign: float = 1.0,
     max_step_rad: Optional[float] = None,
-    limits_rad: tuple[float, float] = RM65_JOINT_LIMITS_RAD[5],
+    limits_rad: tuple[float, float] = AUBO_I7_JOINT_LIMITS_RAD[5],
 ) -> float:
     """Map an unwrapped controller-roll delta to a continuous J6 command."""
 
@@ -453,8 +477,8 @@ class IKResult:
     wrist_target_reached: bool
 
 
-class RM65DecoupledIK:
-    """Local, continuity-preserving RM65 position IK with independent J6."""
+class AuboI7DecoupledIK:
+    """Local, continuity-preserving AUBO i7 position IK with independent J6."""
 
     def __init__(
         self,
@@ -672,14 +696,15 @@ __all__ = (
     "ControllerTwistError",
     "IKOptions",
     "IKResult",
-    "RM65DecoupledIK",
-    "RM65_JOINT_LIMITS_RAD",
-    "RM65_NOMINAL_POSTURE_RAD",
+    "AuboI7DecoupledIK",
+    "AUBO_I7_JOINT_LIMITS_RAD",
+    "AUBO_I7_NOMINAL_POSTURE_RAD",
     "continuous_wrist_roll_target",
+    "collision_key_points",
     "forward_kinematics",
     "geometric_jacobian",
     "nearest_equivalent_angle_within_limits",
     "position_jacobian",
-    "transform_from_xyz_euler",
+    "transform_from_xyz_rotvec",
     "unwrap_angle_near",
 )

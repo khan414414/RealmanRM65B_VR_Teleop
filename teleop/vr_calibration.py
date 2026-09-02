@@ -1,4 +1,4 @@
-"""Guided VR-position calibration for the RM65 base coordinate frame."""
+"""Guided VR-position calibration for the AUBO i7 base frame."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ from typing import Optional, Sequence
 import numpy as np
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INPUT_FRAME = "unity_sender_z_minus_x_y_v1"
-OUTPUT_FRAME = "rm65_base"
+OUTPUT_FRAME = "aubo_i7_base"
 
 
 class CalibrationError(ValueError):
@@ -455,7 +455,11 @@ class GuidedPositionCalibrator:
 
 
 def default_calibration_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "config" / "vr_position_calibration.json"
+    return (
+        Path(__file__).resolve().parents[1]
+        / "config"
+        / "aubo_i7_vr_position_calibration.json"
+    )
 
 
 def save_calibration_atomic(path: Path | str, result: CalibrationResult) -> None:

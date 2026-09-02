@@ -1,16 +1,19 @@
-r"""Safely inspect and replay an RM65-B state log as a joint trajectory.
+r"""Safely inspect and replay an AUBO i7 state log as a joint trajectory.
 
-Dry-run validation is the default.  The robot is contacted only when
-``--execute`` is supplied, and motion still requires an interactive ``REPLAY``
-confirmation.  NPZ is preferred because it preserves integer timestamps and
-float arrays without CSV formatting loss.
+Dry-run validation is the default.  Physical replay additionally requires
+``--execute``, an interactive ``REPLAY`` confirmation, and (when the robot is
+not already at the recorded start pose) ``--move-to-start``.
 
-Examples::
+Usage examples::
 
-    python -m Realman_Control.replay_rm65_trajectory C:\RM65Logs\RM65_state.npz
+    python -m Aubo_Control.replay_aubo_i7_trajectory C:\AUBOLogs\AUBO_i7_state.npz
+    python -m Aubo_Control.replay_aubo_i7_trajectory \
+        C:\AUBOLogs\AUBO_i7_state.npz --execute --move-to-start
 
-    python -m Realman_Control.replay_rm65_trajectory \
-        C:\RM65Logs\RM65_state.npz --execute --move-to-start
+The tool never sends a command before the interpolated trajectory passed every
+check: strictly increasing timestamps, no recorded poll errors, finite joints,
+controller/model joint limits, per-joint speed ceiling and per-command step
+ceiling.
 """
 
 from __future__ import annotations
@@ -18,7 +21,6 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,32 +28,13 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from Realman_Control.realman_control import RM65B
+from Aubo_Control.aubo_control import AuboI7
+from teleop.aubo_i7_decoupled_ik import AUBO_I7_JOINT_LIMITS_RAD
 
 
 JOINT_COUNT = 6
 DEFAULT_OUTPUT_HZ = 50.0
-
-ARM_STATUS_NAMES = {
-    0: "idle",
-    1: "move_l",
-    2: "move_j",
-    3: "move_c",
-    4: "move_s",
-    5: "joint_passthrough",
-    6: "pose_passthrough",
-    7: "force_pose_passthrough",
-    8: "current_passthrough",
-    9: "stop",
-    10: "slow_stop",
-    11: "pause",
-    12: "current_drag",
-    13: "sensor_drag",
-    14: "teach_demonstration",
-    15: "trajectory_reproduction",
-    16: "move_initial_position",
-    17: "cartesian_velocity_passthrough",
-}
+MODEL_LIMIT_SOURCE = "aubo_i7_30_urdf_fallback"
 
 
 class ReplayValidationError(ValueError):
@@ -63,8 +46,7 @@ class RecordedTrajectory:
     source_path: Path
     time_s: np.ndarray
     joint_rad: np.ndarray
-    sdk_error_code: np.ndarray
-    arm_current_status: np.ndarray
+    poll_error: np.ndarray
     merged_duplicate_timestamps: int
 
     @property
@@ -109,51 +91,38 @@ def _build_recorded_trajectory(
     path: Path,
     time_s: np.ndarray,
     joints: np.ndarray,
-    sdk_errors: np.ndarray,
-    arm_status: np.ndarray,
+    poll_error: np.ndarray,
 ) -> RecordedTrajectory:
     sample_count = len(time_s)
     if joints.ndim != 2 or joints.shape[0] != sample_count:
         raise ReplayValidationError(
             "Joint sample count does not match the timestamp count"
         )
-    if sdk_errors.shape != (sample_count,):
+    if poll_error.shape != (sample_count,):
         raise ReplayValidationError(
-            "SDK error sample count does not match the timestamp count"
-        )
-    if arm_status.shape != (sample_count,):
-        raise ReplayValidationError(
-            "Arm-status sample count does not match the timestamp count"
+            "Poll-error sample count does not match the timestamp count"
         )
     if len(time_s) and np.any(np.diff(time_s) < 0.0):
         raise ReplayValidationError("Trajectory timestamps move backwards")
 
     keep = np.ones(len(time_s), dtype=np.bool_)
     if len(time_s) > 1:
-        # Keep the newest state when Windows gives consecutive callbacks the
-        # same monotonic-clock value.
+        # Keep the newest state when consecutive polls share one monotonic
+        # clock value.
         keep[:-1] = time_s[:-1] != time_s[1:]
     merged = int(np.count_nonzero(~keep))
     time_s = time_s[keep]
     joints = joints[keep]
-    sdk_errors = sdk_errors[keep]
-    arm_status = arm_status[keep]
+    poll_error = poll_error[keep]
     if len(time_s):
         time_s = time_s - time_s[0]
-    return RecordedTrajectory(
-        path,
-        time_s,
-        joints,
-        sdk_errors,
-        arm_status,
-        merged,
-    )
+    return RecordedTrajectory(path, time_s, joints, poll_error, merged)
 
 
 def _load_npz(path: Path) -> RecordedTrajectory:
     try:
         with np.load(path, allow_pickle=False) as data:
-            required = {"joint_rad", "sdk_error_code", "arm_current_status"}
+            required = {"joint_rad", "poll_error"}
             missing = sorted(required.difference(data.files))
             if missing:
                 raise ReplayValidationError(
@@ -161,11 +130,8 @@ def _load_npz(path: Path) -> RecordedTrajectory:
                 )
 
             joints = np.asarray(data["joint_rad"], dtype=np.float64).copy()
-            sdk_errors = np.asarray(
-                data["sdk_error_code"], dtype=np.int32
-            ).copy()
-            arm_status = np.asarray(
-                data["arm_current_status"], dtype=np.int32
+            poll_error = np.asarray(
+                data["poll_error"], dtype=np.uint8
             ).copy()
 
             if "mono_ns" in data.files:
@@ -184,26 +150,20 @@ def _load_npz(path: Path) -> RecordedTrajectory:
     if time_ns.ndim != 1 or not len(time_ns):
         raise ReplayValidationError("NPZ contains no one-dimensional timestamps")
     time_s = (time_ns - time_ns[0]).astype(np.float64) / 1_000_000_000.0
-    return _build_recorded_trajectory(
-        path, time_s, joints, sdk_errors, arm_status
-    )
+    return _build_recorded_trajectory(path, time_s, joints, poll_error)
 
 
 def _load_csv(path: Path) -> RecordedTrajectory:
     joint_fields = [f"joint_{index}_rad" for index in range(1, 7)]
     times: list[int] = []
     joints: list[list[float]] = []
-    sdk_errors: list[int] = []
-    arm_status: list[int] = []
+    poll_errors: list[int] = []
 
     try:
         with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
             reader = csv.DictReader(csv_file)
             fields = set(reader.fieldnames or [])
-            required = set(joint_fields) | {
-                "sdk_error_code",
-                "arm_current_status",
-            }
+            required = set(joint_fields) | {"poll_error"}
             missing = sorted(required.difference(fields))
             if missing:
                 raise ReplayValidationError(
@@ -230,16 +190,9 @@ def _load_csv(path: Path) -> RecordedTrajectory:
                     _parse_csv_integer(row[time_field], time_field, row_number)
                 )
                 joints.append(joint_row)
-                sdk_errors.append(
+                poll_errors.append(
                     _parse_csv_integer(
-                        row["sdk_error_code"], "sdk_error_code", row_number
-                    )
-                )
-                arm_status.append(
-                    _parse_csv_integer(
-                        row["arm_current_status"],
-                        "arm_current_status",
-                        row_number,
+                        row["poll_error"], "poll_error", row_number
                     )
                 )
     except OSError as exc:
@@ -253,8 +206,7 @@ def _load_csv(path: Path) -> RecordedTrajectory:
         path,
         time_s,
         np.asarray(joints, dtype=np.float64),
-        np.asarray(sdk_errors, dtype=np.int32),
-        np.asarray(arm_status, dtype=np.int32),
+        np.asarray(poll_errors, dtype=np.uint8),
     )
 
 
@@ -282,12 +234,8 @@ def validate_recorded_trajectory(trajectory: RecordedTrajectory) -> None:
             "joint_rad must have shape (sample_count, 6); got "
             f"{trajectory.joint_rad.shape}"
         )
-    if trajectory.sdk_error_code.shape != (sample_count,):
-        raise ReplayValidationError("sdk_error_code length does not match joints")
-    if trajectory.arm_current_status.shape != (sample_count,):
-        raise ReplayValidationError(
-            "arm_current_status length does not match joints"
-        )
+    if trajectory.poll_error.shape != (sample_count,):
+        raise ReplayValidationError("poll_error length does not match joints")
     if not np.all(np.isfinite(trajectory.time_s)):
         raise ReplayValidationError("Trajectory timestamps contain non-finite values")
     if not np.all(np.isfinite(trajectory.joint_rad)):
@@ -298,12 +246,11 @@ def validate_recorded_trajectory(trajectory: RecordedTrajectory) -> None:
         )
     if trajectory.duration_s <= 0.0:
         raise ReplayValidationError("Trajectory duration must be positive")
-    nonzero_errors = np.flatnonzero(trajectory.sdk_error_code != 0)
-    if len(nonzero_errors):
-        first = int(nonzero_errors[0])
-        code = int(trajectory.sdk_error_code[first])
+    failed_polls = np.flatnonzero(trajectory.poll_error != 0)
+    if len(failed_polls):
+        first = int(failed_polls[0])
         raise ReplayValidationError(
-            f"Recorded SDK error code {code} at sample {first}; refusing replay"
+            f"Recorded poll error at sample {first}; refusing replay"
         )
 
 
@@ -331,10 +278,10 @@ def _trim_idle_indices(
 def _apply_joint_limits(
     joints: np.ndarray,
     tolerance_rad: float,
+    limits_rad: np.ndarray,
 ) -> tuple[np.ndarray, int, float]:
-    limits = np.asarray(RM65B.JOINT_LIMITS, dtype=np.float64)
-    lower = limits[:, 0]
-    upper = limits[:, 1]
+    lower = limits_rad[:, 0]
+    upper = limits_rad[:, 1]
     lower_excess = np.maximum(lower - joints, 0.0)
     upper_excess = np.maximum(joints - upper, 0.0)
     max_excess = float(max(np.max(lower_excess), np.max(upper_excess)))
@@ -364,6 +311,7 @@ def prepare_trajectory(
     speed_scale: float,
     max_joint_speed_rad_s: float,
     max_joint_step_rad: float,
+    limits_rad: np.ndarray,
 ) -> PreparedTrajectory:
     if keep_idle:
         start_index, end_index = 0, len(trajectory.time_s)
@@ -376,7 +324,7 @@ def prepare_trajectory(
     source_time -= source_time[0]
     source_joints = trajectory.joint_rad[start_index:end_index].copy()
     source_joints, clipped_count, max_excess = _apply_joint_limits(
-        source_joints, limit_tolerance_rad
+        source_joints, limit_tolerance_rad, limits_rad
     )
 
     source_duration = float(source_time[-1])
@@ -439,15 +387,9 @@ def print_summary(
     recorded: RecordedTrajectory,
     prepared: PreparedTrajectory,
     speed_scale: float,
+    limit_source: str,
 ) -> None:
-    unique_status, status_counts = np.unique(
-        recorded.arm_current_status, return_counts=True
-    )
-    status_text = ", ".join(
-        f"{int(status)}:{ARM_STATUS_NAMES.get(int(status), 'unknown')}="
-        f"{int(count)}"
-        for status, count in zip(unique_status, status_counts)
-    )
+    failed = int(np.count_nonzero(recorded.poll_error))
 
     dt = np.diff(prepared.time_s)
     joint_delta = np.diff(prepared.joint_rad, axis=0)
@@ -461,7 +403,8 @@ def print_summary(
         f"{recorded.merged_duplicate_timestamps}"
     )
     print(f"Recorded duration:      {recorded.duration_s:.3f} s")
-    print(f"Recorded arm statuses:  {status_text}")
+    print(f"Recorded poll errors:   {failed}")
+    print(f"Joint limit source:     {limit_source}")
     print(
         "Selected source range:  "
         f"{prepared.source_start_index}..{prepared.source_end_index}"
@@ -520,17 +463,30 @@ def execute_replay(
     robot_ip: str,
     robot_port: int,
     move_to_start: bool,
-    approach_speed_percent: int,
+    approach_speed_rad_s: float,
+    approach_acceleration_rad_s2: float,
     start_tolerance_rad: float,
     output_hz: float,
     max_schedule_lag_s: float,
     hold_seconds: float,
 ) -> None:
-    robot: Optional[RM65B] = None
+    robot: Optional[AuboI7] = None
     motion_started = False
     primary_error: Optional[BaseException] = None
     try:
-        robot = RM65B(robot_ip, port=robot_port)
+        robot = AuboI7(robot_ip, port=robot_port)
+        controller_limits = np.asarray(
+            robot.get_joint_limits(), dtype=np.float64
+        )
+        _, _, max_excess = _apply_joint_limits(
+            prepared.joint_rad, 0.0, controller_limits
+        )
+        if max_excess > 0.0:
+            raise RuntimeError(
+                "Recorded joints exceed the controller-configured limits; "
+                "refusing replay"
+            )
+
         current_joints = np.asarray(robot.get_joint_values(), dtype=np.float64)
         start_joints = prepared.joint_rad[0]
         start_delta = np.max(np.abs(start_joints - current_joints))
@@ -550,8 +506,8 @@ def execute_replay(
         if requires_approach:
             robot.move_joint(
                 start_joints,
-                speed_percent=approach_speed_percent,
-                asynchronous=False,
+                speed=approach_speed_rad_s,
+                acceleration=approach_acceleration_rad_s2,
             )
             reached = np.asarray(robot.get_joint_values(), dtype=np.float64)
             reached_error = float(np.max(np.abs(reached - start_joints)))
@@ -566,6 +522,7 @@ def execute_replay(
             print(f"{remaining}...")
             time.sleep(1.0)
 
+        robot.start_servo_mode()
         command_period_s = 1.0 / output_hz
         start_ns = time.perf_counter_ns()
         for index, (scheduled_s, joints) in enumerate(
@@ -623,24 +580,20 @@ def nonnegative_float(value: str) -> float:
     return result
 
 
-def percentage(value: str) -> int:
-    result = int(value)
-    if not 1 <= result <= 100:
-        raise argparse.ArgumentTypeError("value must be in 1..100")
-    return result
-
-
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate and replay an RM65-B CSV/NPZ state log. Dry run is the "
+            "Validate and replay an AUBO i7 CSV/NPZ state log. Dry run is the "
             "default; --execute and interactive confirmation are required for "
             "physical motion."
         )
     )
-    parser.add_argument("trajectory", type=Path, help="RM65_state .npz or .csv")
-    parser.add_argument("--robot-ip", default="192.168.1.18")
-    parser.add_argument("--robot-port", type=int, default=8080)
+    parser.add_argument("trajectory", type=Path, help="AUBO_i7_state .npz or .csv")
+    parser.add_argument("--robot-ip", default=AuboI7.DEFAULT_IP)
+    parser.add_argument("--port", type=int, default=AuboI7.DEFAULT_PORT)
+    parser.add_argument("--robot-name", default=None)
+    parser.add_argument("--username", default=AuboI7.DEFAULT_USERNAME)
+    parser.add_argument("--password", default=AuboI7.DEFAULT_PASSWORD)
     parser.add_argument(
         "--execute",
         action="store_true",
@@ -661,7 +614,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--output-hz",
         type=positive_float,
         default=DEFAULT_OUTPUT_HZ,
-        help="Interpolated CAN-FD command rate (default: 50 Hz).",
+        help="Interpolated servo command rate (default: 50 Hz).",
     )
     parser.add_argument(
         "--keep-idle",
@@ -699,10 +652,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Maximum allowed change in one interpolated command.",
     )
     parser.add_argument(
-        "--approach-speed-percent",
-        type=percentage,
-        default=5,
-        help="Planned speed percentage for --move-to-start.",
+        "--approach-speed-deg-s",
+        type=positive_float,
+        default=10.0,
+        help="Planned move-to-start speed per joint (default: 10 deg/s).",
+    )
+    parser.add_argument(
+        "--approach-acceleration-deg-s2",
+        type=positive_float,
+        default=20.0,
+        help="Planned move-to-start acceleration (default: 20 deg/s^2).",
     )
     parser.add_argument(
         "--start-tolerance-deg",
@@ -733,8 +692,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     if args.output_hz > 100.0:
         raise ReplayValidationError("--output-hz above 100 is disabled for safety")
-    if not 0 < int(args.robot_port) <= 65535:
-        raise ReplayValidationError("--robot-port must be in 1..65535")
+    if not 0 < int(args.port) <= 65535:
+        raise ReplayValidationError("--port must be in 1..65535")
+
+    # The controller limits are authoritative but require a live connection;
+    # the dry run falls back to the i7_30 URDF model limits.
+    limits_rad = np.asarray(AUBO_I7_JOINT_LIMITS_RAD, dtype=np.float64)
+    limit_source = MODEL_LIMIT_SOURCE
 
     recorded = load_recorded_trajectory(args.trajectory)
     prepared = prepare_trajectory(
@@ -747,12 +711,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         speed_scale=args.speed_scale,
         max_joint_speed_rad_s=math.radians(args.max_joint_speed_deg_s),
         max_joint_step_rad=math.radians(args.max_joint_step_deg),
+        limits_rad=limits_rad,
     )
-    print_summary(recorded, prepared, args.speed_scale)
+    print_summary(recorded, prepared, args.speed_scale, limit_source)
 
     if not args.execute:
         print()
         print("DRY RUN ONLY: the robot was not contacted and no motion was sent.")
+        print(
+            f"Joint limits used the {limit_source}; execution re-validates "
+            "against the controller-configured limits."
+        )
         print("Review the summary, then add --execute when the workspace is safe.")
         if not args.move_to_start:
             print(
@@ -764,9 +733,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     execute_replay(
         prepared,
         robot_ip=args.robot_ip,
-        robot_port=args.robot_port,
+        robot_port=args.port,
         move_to_start=args.move_to_start,
-        approach_speed_percent=args.approach_speed_percent,
+        approach_speed_rad_s=math.radians(args.approach_speed_deg_s),
+        approach_acceleration_rad_s2=math.radians(
+            args.approach_acceleration_deg_s2
+        ),
         start_tolerance_rad=math.radians(args.start_tolerance_deg),
         output_hz=args.output_hz,
         max_schedule_lag_s=args.max_schedule_lag_ms / 1000.0,
@@ -776,15 +748,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        exit_code = main()
-    except ReplayValidationError as exc:
-        print(f"Trajectory validation failed: {exc}", file=sys.stderr)
-        raise SystemExit(2)
-    except KeyboardInterrupt:
-        raise SystemExit(130)
-    except Exception as exc:
-        print(f"Replay failed: {exc}", file=sys.stderr)
-        raise SystemExit(1)
-    else:
-        raise SystemExit(exit_code)
+    raise SystemExit(main())

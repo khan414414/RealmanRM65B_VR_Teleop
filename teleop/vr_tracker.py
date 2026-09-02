@@ -1,4 +1,4 @@
-"""VR-to-RM65 tracking with position-only IK and an independent wrist joint."""
+"""VR-to-AUBO-i7 tracking with position-only IK and an independent wrist."""
 
 from __future__ import annotations
 
@@ -9,14 +9,15 @@ from typing import Optional, Sequence
 
 import numpy as np
 
-from teleop.rm65_decoupled_ik import (
+from teleop.aubo_i7_collision import AuboI7CollisionChecker
+from teleop.aubo_i7_decoupled_ik import (
+    AUBO_I7_JOINT_LIMITS_RAD,
+    AuboI7DecoupledIK,
     ContinuousControllerTwist,
     IKOptions,
-    RM65DecoupledIK,
-    RM65_JOINT_LIMITS_RAD,
     forward_kinematics,
     position_jacobian,
-    transform_from_xyz_euler,
+    transform_from_xyz_rotvec,
 )
 
 
@@ -42,17 +43,18 @@ class VRTracker:
         wrist_roll_axis: Sequence[float] = (1.0, 0.0, 0.0),
         wrist_roll_sign: float = 1.0,
         wrist_roll_gain: float = 1.0,
-        max_joint_speed_rad_s: float = math.radians(180.0),
-        max_cartesian_speed_m_s: float = 0.6,
+        max_joint_speed_rad_s: float = math.radians(90.0),
+        max_cartesian_speed_m_s: float = 0.15,
         safety_approach_scale: float = 0.025,
-        max_position_offset_m: float = 0.25,
+        max_position_offset_m: Optional[float] = 0.25,
         joint_limit_margin_rad: float = math.radians(5.0),
         wrist_limit_margin_rad: float = math.radians(15.0),
         singular_value_limit: float = 0.01,
         max_following_error_rad: float = math.radians(10.0),
         following_error_check_period_s: float = 0.1,
         following_error_settle_time_s: float = 0.15,
-        ik_solver: Optional[RM65DecoupledIK] = None,
+        ik_solver: Optional[AuboI7DecoupledIK] = None,
+        collision_checker: Optional[AuboI7CollisionChecker] = None,
     ) -> None:
         self.rtde = rtde
         self.gripper = gripper
@@ -64,7 +66,12 @@ class VRTracker:
         self.max_joint_speed_rad_s = float(max_joint_speed_rad_s)
         self.max_cartesian_speed_m_s = float(max_cartesian_speed_m_s)
         self.safety_approach_scale = float(safety_approach_scale)
-        self.max_position_offset_m = float(max_position_offset_m)
+        # None (or a non-finite value) disables the workspace sphere entirely;
+        # the target is then only bounded by joint limits and speed limits.
+        if max_position_offset_m is None:
+            self.max_position_offset_m = math.inf
+        else:
+            self.max_position_offset_m = float(max_position_offset_m)
         self.joint_limit_margin_rad = float(joint_limit_margin_rad)
         self.wrist_limit_margin_rad = float(wrist_limit_margin_rad)
         self.singular_value_limit = float(singular_value_limit)
@@ -96,16 +103,21 @@ class VRTracker:
             self.following_error_check_period_s,
             self.following_error_settle_time_s,
         )
-        if not all(math.isfinite(value) and value > 0.0 for value in positive):
+        # math.inf (workspace sphere disabled) is an allowed upper bound.
+        if not all(
+            (math.isfinite(value) or math.isinf(value) and value > 0.0)
+            and value > 0.0
+            for value in positive
+        ):
             raise ValueError("tracking gains, limits and thresholds must be positive")
 
         self._maximum_joint_step = self.max_joint_speed_rad_s * self.rate
         self._maximum_cartesian_step = self.max_cartesian_speed_m_s * self.rate
         if ik_solver is None:
             joint_limits = np.asarray(
-                RM65_JOINT_LIMITS_RAD, dtype=np.float64
+                AUBO_I7_JOINT_LIMITS_RAD, dtype=np.float64
             )
-            self.joint_limit_source = "RM65 model fallback"
+            self.joint_limit_source = "AUBO i7_30 model fallback"
             get_joint_limits = getattr(rtde, "get_joint_limits", None)
             if get_joint_limits is not None:
                 joint_limits = np.asarray(
@@ -113,10 +125,10 @@ class VRTracker:
                 )
                 self.joint_limit_source = "controller/teach pendant"
             tcp_transform = np.eye(4, dtype=np.float64)
-            get_tool_frame = getattr(rtde, "get_active_tool_frame_pose_euler", None)
-            if get_tool_frame is not None:
-                tcp_transform = transform_from_xyz_euler(get_tool_frame())
-            ik_solver = RM65DecoupledIK(
+            get_tcp_offset = getattr(rtde, "get_tcp_offset", None)
+            if get_tcp_offset is not None:
+                tcp_transform = transform_from_xyz_rotvec(get_tcp_offset())
+            ik_solver = AuboI7DecoupledIK(
                 tcp_transform=tcp_transform,
                 joint_limits_rad=joint_limits,
                 options=IKOptions(
@@ -129,6 +141,13 @@ class VRTracker:
         else:
             self.joint_limit_source = "provided IK solver"
         self.ik = ik_solver
+        self.collision_checker = (
+            AuboI7CollisionChecker()
+            if collision_checker is None
+            else collision_checker
+        )
+        if not callable(getattr(self.collision_checker, "validate", None)):
+            raise TypeError("collision_checker must provide validate(joints, tcp)")
         self.joint_limits_rad = self.ik.joint_limits_rad
         margins = np.full(6, self.joint_limit_margin_rad, dtype=np.float64)
         margins[5] = self.wrist_limit_margin_rad
@@ -181,7 +200,7 @@ class VRTracker:
 
     @property
     def position_mapping_matrix(self) -> np.ndarray:
-        """Return the current VR-position to RM65-base mapping."""
+        """Return the current VR-position to AUBO-base mapping."""
 
         return self._position_mapping_matrix.copy()
 
@@ -235,13 +254,22 @@ class VRTracker:
         if validate is not None:
             validate(joints, singular_value_limit=self.singular_value_limit)
 
+    def _candidate_safety_check(self, joints: np.ndarray) -> None:
+        """Apply joint, singularity/controller, self and plane checks."""
+
+        self._joint_margin_check(joints)
+        self._model_singularity_check(joints)
+        self.collision_checker.validate(joints, self.ik.tcp_transform)
+
     def _capture_requested_target(self, controller: np.ndarray) -> bool:
         """Store the newest finite controller intent; newer frames replace it.
 
-        The workspace is a hard sphere around the Trigger anchor.  A target
-        outside that sphere is projected to its surface instead of throwing
-        the whole frame away.  The projected target is then approached through
-        the normal Cartesian and joint rate limits.
+        The workspace is a hard sphere around the Trigger anchor unless
+        ``max_position_offset_m`` is None/infinite, in which case the mapped
+        offset is used as-is and only joint/speed limits bound the motion.
+        A target outside that sphere is projected to its surface instead of
+        throwing the whole frame away.  The projected target is then approached
+        through the normal Cartesian and joint rate limits.
         """
 
         if (
@@ -251,13 +279,14 @@ class VRTracker:
         ):
             raise ValueError("tracking anchors are not initialized")
 
-        relative_translation = 1.5 * (
-            self._position_mapping_matrix @ (
-                controller[:3] - self.input_anchor[:3]
-            )
+        relative_translation = self._position_mapping_matrix @ (
+            controller[:3] - self.input_anchor[:3]
         )
         translation_norm = float(np.linalg.norm(relative_translation))
-        workspace_limited = translation_norm > self.max_position_offset_m
+        workspace_limited = (
+            math.isfinite(self.max_position_offset_m)
+            and translation_norm > self.max_position_offset_m
+        )
         if workspace_limited:
             relative_translation *= self.max_position_offset_m / translation_norm
         requested_position = self.tool_anchor_position + relative_translation
@@ -424,8 +453,7 @@ class VRTracker:
                 "candidate made no progress toward the retained target"
             )
         try:
-            self._joint_margin_check(candidate)
-            self._model_singularity_check(candidate)
+            self._candidate_safety_check(candidate)
         except ValueError as full_error:
             # Only a safety-check failure activates the very slow fallback.
             # A numerically unrelated/non-improving IK result must not be made
@@ -442,15 +470,48 @@ class VRTracker:
             ):
                 raise ValueError(str(full_error)) from full_error
             try:
-                self._joint_margin_check(slow_candidate)
-                self._model_singularity_check(slow_candidate)
+                self._candidate_safety_check(slow_candidate)
             except ValueError as slow_error:
                 raise ValueError(str(slow_error)) from slow_error
             return slow_candidate, slow_position, self.safety_approach_scale
         return candidate, full_position, 1.0
 
+    def _validated_wrist_only_candidate(
+        self,
+    ) -> Optional[tuple[np.ndarray, np.ndarray]]:
+        """Advance J6 safely while J1..J5 remain at their last command."""
+
+        if (
+            self.command_joints is None
+            or self.target_position is None
+            or self.requested_wrist is None
+        ):
+            return None
+        current = self.command_joints
+        wrist_error = self.requested_wrist - float(current[5])
+        if abs(wrist_error) <= 1.0e-12:
+            return None
+
+        candidate = current.copy()
+        candidate[5] += float(
+            np.clip(
+                wrist_error,
+                -self._maximum_joint_step,
+                self._maximum_joint_step,
+            )
+        )
+        candidate = self._clip_joint_target(candidate)
+        candidate, accepted_position, _ = self._rate_limit_cartesian_target(
+            candidate,
+            self._maximum_cartesian_step,
+        )
+        if abs(float(candidate[5]) - float(current[5])) <= 1.0e-12:
+            return None
+        self._candidate_safety_check(candidate)
+        return candidate, accepted_position
+
     def _record_sent_command(self, joints: np.ndarray, sent_at: float) -> None:
-        """Record when a distinct target first entered the CAN-FD stream."""
+        """Record when a distinct target first entered the servo stream."""
 
         command = np.asarray(joints, dtype=np.float64).copy()
         if self._command_history and np.array_equal(
@@ -491,8 +552,8 @@ class VRTracker:
     def _following_error_check(self) -> None:
         """Hold commands while feedback is far from the accepted command.
 
-        The synchronous RM65 state query is deliberately throttled so it does
-        not run in every CAN-FD sample.  J6 is compared as a continuous joint
+        The synchronous AUBO RPC state query is deliberately throttled so it
+        does not run in every servo sample.  J6 is compared as a continuous joint
         angle: reducing its error modulo 2*pi would hide a full-turn mismatch.
         Once blocked, command advancement remains held between feedback checks;
         the newest controller intent is still retained and this module never
@@ -566,8 +627,7 @@ class VRTracker:
             joints = np.asarray(self.rtde.get_joint_values(), dtype=np.float64)
             if joints.shape != (6,) or not np.all(np.isfinite(joints)):
                 raise ValueError("robot returned an invalid joint state")
-            self._joint_margin_check(joints)
-            self._model_singularity_check(joints)
+            self._candidate_safety_check(joints)
 
             tcp_position = forward_kinematics(
                 joints, self.ik.tcp_transform
@@ -734,10 +794,29 @@ class VRTracker:
             )
             return candidate.copy()
         except (ValueError, np.linalg.LinAlgError) as exc:
-            raise self._warning(
-                "latest tracking target retained at the last safe command: "
-                f"{exc}"
-            ) from exc
+            try:
+                wrist_only = self._validated_wrist_only_candidate()
+            except (ValueError, np.linalg.LinAlgError) as wrist_error:
+                raise self._warning(
+                    "latest tracking target retained at the last safe command: "
+                    f"{exc}; J6-only fallback was rejected: {wrist_error}"
+                ) from wrist_error
+            if wrist_only is None:
+                raise self._warning(
+                    "latest tracking target retained at the last safe command: "
+                    f"{exc}"
+                ) from exc
+
+            candidate, accepted_position = wrist_only
+            self.rtde.servo_joint(candidate, time=self.rate)
+            self.command_joints = candidate.copy()
+            self._record_sent_command(self.command_joints, time.monotonic())
+            self.target_position = accepted_position.copy()
+            self.last_warning_reason = (
+                "J1..J5 target is held at its last safe position; advancing "
+                f"J6 independently ({exc})"
+            )
+            return candidate.copy()
 
     def trigger_gripper(self) -> None:
         if self.gripper_open:

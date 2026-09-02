@@ -1,34 +1,43 @@
 import math
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
 
-from teleop.rm65_decoupled_ik import (
-    RM65_JOINT_LIMITS_RAD,
-    RM65_NOMINAL_POSTURE_RAD,
+from teleop.aubo_i7_decoupled_ik import (
+    AUBO_I7_JOINT_LIMITS_RAD,
+    AUBO_I7_NOMINAL_POSTURE_RAD,
     forward_kinematics,
 )
 from teleop.vr_teleop import (
     ControllerSample,
     FixedRateScheduler,
+    MAX_CARTESIAN_SPEED_M_S,
+    MAX_JOINT_SPEED_RAD_S,
+    UNITY_PLANE_ROBOT_Z_M,
+    SimulatedAuboI7,
     StreamFrequencyReporter,
+    UnityJointStatePublisher,
+    format_joint_state_line,
     parse_controller_line,
     process_controller_sample,
+    align_front_back_and_left_right,
+    create_tracker,
 )
 from teleop.vr_tracker import TeleoperationSafetyWarning, VRTracker
 
 
 class FakeRobot:
     def __init__(self):
-        self.joints = np.asarray(RM65_NOMINAL_POSTURE_RAD, dtype=np.float64)
-        self.limits = np.asarray(RM65_JOINT_LIMITS_RAD, dtype=np.float64)
+        self.joints = np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD, dtype=np.float64)
+        self.limits = np.asarray(AUBO_I7_JOINT_LIMITS_RAD, dtype=np.float64)
         self.limit_reads = 0
         self.commands = []
         self.stop_calls = 0
 
-    def get_active_tool_frame_pose_euler(self):
+    def get_tcp_offset(self):
         return [0.0] * 6
 
     def get_joint_values(self):
@@ -73,6 +82,71 @@ class FakeClock:
 
     def __call__(self):
         return self.now
+
+
+class SimulatedAuboI7Tests(unittest.TestCase):
+    def test_starts_at_nominal_posture_and_tracks_servo_commands(self):
+        robot = SimulatedAuboI7()
+        np.testing.assert_allclose(
+            robot.get_joint_values(), AUBO_I7_NOMINAL_POSTURE_RAD
+        )
+        target = np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD) + 0.01
+        self.assertEqual(robot.servo_joint(target, time=0.01), 0)
+        np.testing.assert_allclose(robot.get_joint_values(), target)
+
+    def test_feedback_is_a_copy_and_invalid_commands_are_rejected(self):
+        robot = SimulatedAuboI7()
+        feedback = robot.get_joint_values()
+        feedback[0] += 1.0
+        self.assertNotEqual(feedback, robot.get_joint_values())
+        with self.assertRaises(ValueError):
+            robot.servo_joint([0.0] * 5, time=0.01)
+        with self.assertRaises(ValueError):
+            robot.servo_joint([0.0] * 6, time=0.0)
+
+
+class PositionDirectionMappingTests(unittest.TestCase):
+    def test_legacy_mapping_routes_front_back_and_left_right_separately(self):
+        mapping = align_front_back_and_left_right((-1.0, -1.0, 1.0))
+        expected = np.asarray(
+            (
+                (0.0, -1.0, 0.0),
+                (1.0, 0.0, 0.0),
+                (0.0, 0.0, 1.0),
+            )
+        )
+        np.testing.assert_allclose(mapping, expected)
+
+    def test_calibrated_mapping_preserves_vertical_and_exchanges_horizontal_axes(self):
+        calibrated = np.asarray(
+            (
+                (0.0, 0.0, 1.0),
+                (-1.0, 0.0, 0.0),
+                (0.0, -1.0, 0.0),
+            )
+        )
+        expected = calibrated.copy()
+        expected[:2, :] *= -1.0
+        expected[[0, 1], :] = expected[[1, 0], :]
+        expected[0, :] *= -1.0
+        np.testing.assert_allclose(
+            align_front_back_and_left_right(calibrated), expected
+        )
+
+    def test_application_tracker_uses_increased_motion_speed_limits(self):
+        tracker = create_tracker(
+            SimulatedAuboI7(), FakeGripper(), np.eye(3)
+        )
+        self.assertAlmostEqual(
+            tracker.max_joint_speed_rad_s, MAX_JOINT_SPEED_RAD_S
+        )
+        self.assertAlmostEqual(
+            tracker.max_cartesian_speed_m_s, MAX_CARTESIAN_SPEED_M_S
+        )
+        self.assertAlmostEqual(
+            tracker.collision_checker.plane_z_m,
+            UNITY_PLANE_ROBOT_Z_M,
+        )
 
 
 class VRTrackerTests(unittest.TestCase):
@@ -240,7 +314,7 @@ class VRTrackerTests(unittest.TestCase):
 
     @property
     def anchor_joint_6(self):
-        return float(RM65_NOMINAL_POSTURE_RAD[5])
+        return float(AUBO_I7_NOMINAL_POSTURE_RAD[5])
 
     def test_mapped_unity_roll_moves_only_j6(self):
         controller = self.anchor.copy()
@@ -249,7 +323,7 @@ class VRTrackerTests(unittest.TestCase):
         command = self.tracker.track(controller)
 
         np.testing.assert_allclose(
-            command[:5], np.asarray(RM65_NOMINAL_POSTURE_RAD[:5]), atol=1.0e-12
+            command[:5], np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD[:5]), atol=1.0e-12
         )
         self.assertLess(command[5], self.anchor_joint_6)
         self.assertLessEqual(
@@ -345,7 +419,7 @@ class VRTrackerTests(unittest.TestCase):
 
         self.assertEqual(len(self.robot.commands), 1)
         self.assertGreater(
-            np.linalg.norm(command - np.asarray(RM65_NOMINAL_POSTURE_RAD)),
+            np.linalg.norm(command - np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD)),
             0.0,
         )
         np.testing.assert_allclose(
@@ -464,10 +538,22 @@ class VRTrackerTests(unittest.TestCase):
         original_solve = self.tracker.ik.solve
         captured = {}
         validation_calls = []
+        cartesian_inputs = []
+
+        original_cartesian_limit = (
+            self.tracker._rate_limit_cartesian_target
+        )
 
         def capture_result(*args, **kwargs):
             result = original_solve(*args, **kwargs)
             captured["result"] = result
+            return result
+
+        def capture_cartesian_limit(joints, maximum_step_m):
+            # Record the limiter outputs so the expected slow step can be
+            # derived from the exact full candidate that ``track()`` used.
+            result = original_cartesian_limit(joints, maximum_step_m)
+            cartesian_inputs.append(result[0].copy())
             return result
 
         def reject_only_full_step(joints):
@@ -478,11 +564,15 @@ class VRTrackerTests(unittest.TestCase):
                 )
 
         self.tracker.ik.solve = capture_result
+        self.tracker._rate_limit_cartesian_target = capture_cartesian_limit
         self.tracker._model_singularity_check = reject_only_full_step
 
         command = self.tracker.track(controller)
 
-        clipped = self.tracker._clip_joint_target(captured["result"].joints_rad)
+        # The slow candidate is the safety-scaled remainder of the full
+        # rate-limited candidate, i.e. the first limiter output captured
+        # above.
+        clipped = cartesian_inputs[0]
         full_delta = clipped - previous
         largest = np.max(np.abs(full_delta))
         if largest > self.tracker._maximum_joint_step:
@@ -521,6 +611,72 @@ class VRTrackerTests(unittest.TestCase):
         self.assertIsNotNone(command)
         self.assertEqual(len(self.robot.commands), 1)
         np.testing.assert_allclose(self.tracker.requested_position, retained)
+
+    def test_j6_advances_when_j1_to_j5_cannot_make_position_progress(self):
+        controller = self.anchor.copy()
+        controller[0] += 0.01
+        controller[3:] = self.mapped_axis_quaternion((1.0, 0.0, 0.0), 10.0)
+        previous = self.tracker.command_joints.copy()
+        stalled = previous.copy()
+        stalled[5] += self.tracker._maximum_joint_step
+        self.tracker.ik.solve = lambda *args, **kwargs: SimpleNamespace(
+            joints_rad=stalled,
+            converged=False,
+            status="trust_region_or_limit_reached",
+            position_error_m=0.01,
+            minimum_singular_value=1.0,
+        )
+
+        command = self.tracker.track(controller)
+
+        np.testing.assert_allclose(command[:5], previous[:5], atol=1.0e-12)
+        self.assertGreater(abs(command[5] - previous[5]), 0.0)
+        self.assertLessEqual(
+            abs(command[5] - previous[5]),
+            self.tracker._maximum_joint_step + 1.0e-12,
+        )
+        self.assertIn("advancing J6 independently", self.tracker.last_warning_reason)
+        self.assertEqual(len(self.robot.commands), 1)
+
+    def test_j6_only_fallback_is_still_blocked_by_collision_check(self):
+        controller = self.anchor.copy()
+        controller[0] += 0.01
+        controller[3:] = self.mapped_axis_quaternion((1.0, 0.0, 0.0), 10.0)
+        previous = self.tracker.command_joints.copy()
+        stalled = previous.copy()
+        stalled[5] += self.tracker._maximum_joint_step
+        self.tracker.ik.solve = lambda *args, **kwargs: SimpleNamespace(
+            joints_rad=stalled,
+            converged=False,
+            status="trust_region_or_limit_reached",
+            position_error_m=0.01,
+            minimum_singular_value=1.0,
+        )
+
+        class RejectWristMotion:
+            def validate(inner_self, joints, tcp_transform):
+                del inner_self, tcp_transform
+                if abs(float(joints[5]) - float(previous[5])) > 1.0e-12:
+                    raise ValueError("flange would collide during J6 motion")
+
+        self.tracker.collision_checker = RejectWristMotion()
+        with self.assertRaisesRegex(
+            TeleoperationSafetyWarning,
+            "J6-only fallback was rejected.*flange would collide",
+        ):
+            self.tracker.track(controller)
+        self.assertEqual(self.robot.commands, [])
+
+    def test_resume_rejects_a_posture_below_the_plane(self):
+        self.tracker.pause()
+        self.robot.joints = np.radians(
+            (0.0, -60.0, 75.0, 0.0, 75.0, 0.0)
+        )
+        with self.assertRaisesRegex(
+            TeleoperationSafetyWarning, "too close to the plane"
+        ):
+            self.tracker.resume(self.anchor)
+        self.assertTrue(self.tracker.paused)
 
     def test_following_error_is_time_aligned_then_catches_up_with_keepalive(self):
         clock = FakeClock()
@@ -675,6 +831,109 @@ class ControllerProtocolTests(unittest.TestCase):
     def test_parse_controller_line_rejects_partial_record(self):
         with self.assertRaises(ValueError):
             parse_controller_line("1,2,3")
+
+    def test_format_joint_state_line_contains_traceable_radian_command(self):
+        line = format_joint_state_line(
+            7,
+            (0.0, -1.0, 1.25, 0.5, -0.25, math.pi),
+            source_sequence=42,
+            source_unity_time_s=12.5,
+            python_time_s=99.25,
+            mode="keepalive_stale",
+        )
+
+        fields = line.rstrip("\n").split(",")
+        self.assertEqual(len(fields), 12)
+        self.assertEqual(fields[:6], [
+            "J1",
+            "7",
+            "42",
+            "12.500000",
+            "99.250000",
+            "keepalive_stale",
+        ])
+        self.assertAlmostEqual(float(fields[7]), -1.0)
+        self.assertAlmostEqual(float(fields[11]), math.pi, places=8)
+
+    def test_format_joint_state_line_rejects_invalid_angles_and_mode(self):
+        with self.assertRaises(ValueError):
+            format_joint_state_line(0, (0.0,) * 5, python_time_s=1.0)
+        with self.assertRaises(ValueError):
+            format_joint_state_line(
+                0,
+                (0.0, 0.0, 0.0, 0.0, 0.0, math.nan),
+                python_time_s=1.0,
+            )
+        with self.assertRaises(ValueError):
+            format_joint_state_line(
+                0,
+                (0.0,) * 6,
+                python_time_s=1.0,
+                mode="bad,mode",
+            )
+
+    def test_joint_state_publisher_writes_off_the_control_thread(self):
+        class RecordingTransport:
+            def __init__(self):
+                self.payloads = []
+                self.sent = threading.Event()
+
+            def sendall(self, payload):
+                self.payloads.append(payload)
+                self.sent.set()
+
+        transport = RecordingTransport()
+        publisher = UnityJointStatePublisher(transport)
+        try:
+            sequence = publisher.publish(
+                (0.0, 0.1, 0.2, 0.3, 0.4, 0.5),
+                source_sequence=9,
+                source_unity_time_s=2.0,
+                python_time_s=3.0,
+            )
+            self.assertEqual(sequence, 0)
+            self.assertTrue(transport.sent.wait(1.0))
+            self.assertEqual(len(transport.payloads), 1)
+            self.assertTrue(transport.payloads[0].startswith(b"J1,0,9,"))
+        finally:
+            publisher.close()
+        self.assertIsNone(publisher.publish((0.0,) * 6))
+
+    def test_joint_state_publisher_replaces_an_unsent_older_value(self):
+        class BlockingFirstTransport:
+            def __init__(self):
+                self.payloads = []
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self.two_sent = threading.Event()
+                self.is_first = True
+
+            def sendall(self, payload):
+                if self.is_first:
+                    self.is_first = False
+                    self.first_started.set()
+                    self.release_first.wait(2.0)
+                self.payloads.append(payload)
+                if len(self.payloads) >= 2:
+                    self.two_sent.set()
+
+        transport = BlockingFirstTransport()
+        publisher = UnityJointStatePublisher(transport)
+        try:
+            publisher.publish((0.0,) * 6, python_time_s=1.0)
+            self.assertTrue(transport.first_started.wait(1.0))
+            publisher.publish((1.0,) * 6, python_time_s=2.0)
+            publisher.publish((2.0,) * 6, python_time_s=3.0)
+            transport.release_first.set()
+            self.assertTrue(transport.two_sent.wait(1.0))
+        finally:
+            publisher.close()
+
+        sequences = [
+            int(payload.decode("ascii").split(",", 2)[1])
+            for payload in transport.payloads
+        ]
+        self.assertEqual(sequences, [0, 2])
 
 
 class FrequencySynchronizationTests(unittest.TestCase):

@@ -3,13 +3,13 @@ import unittest
 
 import numpy as np
 
-from teleop.rm65_decoupled_ik import (
+from teleop.aubo_i7_decoupled_ik import (
+    AUBO_I7_JOINT_LIMITS_RAD,
+    AUBO_I7_NOMINAL_POSTURE_RAD,
+    AuboI7DecoupledIK,
     ContinuousControllerTwist,
     ControllerTwistError,
     IKOptions,
-    RM65DecoupledIK,
-    RM65_JOINT_LIMITS_RAD,
-    RM65_NOMINAL_POSTURE_RAD,
     continuous_wrist_roll_target,
     forward_kinematics,
     geometric_jacobian,
@@ -17,9 +17,9 @@ from teleop.rm65_decoupled_ik import (
 )
 
 
-class RM65KinematicsTests(unittest.TestCase):
+class AuboI7KinematicsTests(unittest.TestCase):
     def setUp(self):
-        self.nominal = np.asarray(RM65_NOMINAL_POSTURE_RAD)
+        self.nominal = np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD)
 
     def test_nominal_posture_has_full_geometric_rank(self):
         jacobian = geometric_jacobian(self.nominal)
@@ -61,10 +61,10 @@ class RM65KinematicsTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(j6_column), 0.02)
 
 
-class RM65DecoupledIKTests(unittest.TestCase):
+class AuboI7DecoupledIKTests(unittest.TestCase):
     def setUp(self):
-        self.seed = np.asarray(RM65_NOMINAL_POSTURE_RAD)
-        self.solver = RM65DecoupledIK(
+        self.seed = np.asarray(AUBO_I7_NOMINAL_POSTURE_RAD)
+        self.solver = AuboI7DecoupledIK(
             options=IKOptions(
                 max_solution_delta_rad=math.radians(20.0),
                 max_wrist_step_rad=math.radians(10.0),
@@ -81,7 +81,7 @@ class RM65DecoupledIKTests(unittest.TestCase):
             target_position,
             self.seed,
             wrist_joint_6_target_rad=wrist_target,
-            posture_reference_rad=RM65_NOMINAL_POSTURE_RAD,
+            posture_reference_rad=AUBO_I7_NOMINAL_POSTURE_RAD,
         )
         self.assertTrue(result.converged, result)
         self.assertLess(result.position_error_m, 2.0e-5)
@@ -92,7 +92,7 @@ class RM65DecoupledIKTests(unittest.TestCase):
         far_configuration = np.radians((80.0, -30.0, 100.0, 50.0, 80.0, 0.0))
         far_position = forward_kinematics(far_configuration)[:3, 3]
         result = self.solver.solve(far_position, self.seed)
-        limits = np.asarray(RM65_JOINT_LIMITS_RAD)
+        limits = np.asarray(AUBO_I7_JOINT_LIMITS_RAD)
         self.assertTrue(np.all(result.joints_rad >= limits[:, 0]))
         self.assertTrue(np.all(result.joints_rad <= limits[:, 1]))
         self.assertLessEqual(
@@ -101,9 +101,9 @@ class RM65DecoupledIKTests(unittest.TestCase):
         )
 
     def test_custom_controller_limits_are_authoritative(self):
-        limits = np.asarray(RM65_JOINT_LIMITS_RAD, dtype=np.float64)
+        limits = np.asarray(AUBO_I7_JOINT_LIMITS_RAD, dtype=np.float64)
         limits[0] = (-0.1, 0.1)
-        solver = RM65DecoupledIK(joint_limits_rad=limits)
+        solver = AuboI7DecoupledIK(joint_limits_rad=limits)
         outside_seed = self.seed.copy()
         outside_seed[0] = 0.2
 

@@ -1,10 +1,15 @@
 import math
 import select
 import socket
+import threading
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
+import numpy as np
+
+from teleop.aubo_i7_collision import AuboI7CollisionChecker
+from teleop.aubo_i7_decoupled_ik import AUBO_I7_NOMINAL_POSTURE_RAD
 from teleop.gripper_request import GripperRequest
 from teleop.vr_calibration import (
     CalibrationError,
@@ -15,11 +20,81 @@ from teleop.vr_calibration import (
     save_calibration_atomic,
 )
 from teleop.vr_tracker import TeleoperationSafetyWarning, VRTracker
-from Realman_Control.realman_control import RM65B
+from Aubo_Control.aubo_control import AuboI7
 
 
 ROBOT_COMMAND_RATE_HZ = 100.0
 MAX_FRESH_SAMPLE_AGE_S = 0.050
+MAX_JOINT_SPEED_RAD_S = math.radians(180.0)
+MAX_CARTESIAN_SPEED_M_S = 0.5
+UNITY_PLANE_ROBOT_Z_M = -0.05
+LEGACY_POSITION_MAPPING = (-1.0, -1.0, 1.0)
+# Hand-to-robot motion ratio.  The controller displacement is multiplied by
+# this scale after axis alignment, so 1.5 means a 1 cm hand motion moves the
+# TCP 1.5 cm.  The direction mapping itself stays calibrated at unit length.
+VR_TO_ROBOT_MOTION_SCALE = 1.5
+
+
+def align_front_back_and_left_right(position_mapping, scale=1.0):
+    """Route controller front/back and left/right to the matching robot axes.
+
+    ``scale`` multiplies the aligned mapping uniformly, setting the hand-to-
+    robot displacement ratio without changing any direction.
+    """
+
+    mapping = np.asarray(position_mapping, dtype=np.float64)
+    if mapping.shape == (3,):
+        mapping = np.diag(mapping)
+    if mapping.shape != (3, 3) or not np.all(np.isfinite(mapping)):
+        raise ValueError("position mapping must be a finite length-3 or 3x3 value")
+    scale = float(scale)
+    if not math.isfinite(scale) or scale <= 0.0:
+        raise ValueError("position mapping scale must be positive")
+    aligned_mapping = mapping.copy()
+    # Keep the requested horizontal direction signs, then exchange the robot
+    # X/Y output rows so front/back and left/right no longer drive each other.
+    aligned_mapping[:2, :] *= -1.0
+    aligned_mapping[[0, 1], :] = aligned_mapping[[1, 0], :]
+    # The physical/visual lateral axis is opposite to the controller's lateral
+    # convention.  Reverse only that output; front/back and vertical stay put.
+    aligned_mapping[0, :] *= -1.0
+    return aligned_mapping * scale
+
+
+class SimulatedAuboI7:
+    """Minimal joint-level plant used until the operator connects hardware.
+
+    The simulator accepts the same ``servo_joint`` calls as :class:`AuboI7`
+    and treats each accepted command as immediate joint feedback.  Unity still
+    receives the checked joint targets through ``UnityJointStatePublisher``;
+    no ARCS SDK connection is opened by this class.
+    """
+
+    def __init__(self, initial_joints=AUBO_I7_NOMINAL_POSTURE_RAD) -> None:
+        self._joints = self._joint_vector(initial_joints)
+
+    @staticmethod
+    def _joint_vector(joints: Sequence[float]) -> list[float]:
+        try:
+            values = [float(value) for value in joints]
+        except (TypeError, ValueError) as exc:
+            raise ValueError("joint target must contain six finite angles") from exc
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            raise ValueError("joint target must contain six finite angles")
+        return values
+
+    def get_joint_values(self) -> list[float]:
+        return self._joints.copy()
+
+    def servo_joint(self, joints: Sequence[float], *, time: float) -> int:
+        period = float(time)
+        if not math.isfinite(period) or period <= 0.0:
+            raise ValueError("servo period must be positive")
+        self._joints = self._joint_vector(joints)
+        return 0
+
+    def close(self) -> None:
+        pass
 
 
 @dataclass(frozen=True)
@@ -31,6 +106,164 @@ class ControllerSample:
     trigger_held: bool
     sequence_id: Optional[int] = None
     unity_time_s: Optional[float] = None
+
+
+def format_joint_state_line(
+    command_sequence: int,
+    joints_rad: Sequence[float],
+    *,
+    source_sequence: Optional[int] = None,
+    source_unity_time_s: Optional[float] = None,
+    python_time_s: Optional[float] = None,
+    mode: str = "track",
+) -> str:
+    """Serialize one accepted AUBO command for Unity protocol ``J1``.
+
+    The six angles are radians in controller J1..J6 order.  Missing timing
+    metadata from a legacy Unity sender is represented by ``-1``.
+    """
+
+    if (
+        isinstance(command_sequence, bool)
+        or not isinstance(command_sequence, int)
+        or command_sequence < 0
+    ):
+        raise ValueError("command_sequence must be a non-negative integer")
+
+    if source_sequence is None:
+        unity_sequence = -1
+    else:
+        if (
+            isinstance(source_sequence, bool)
+            or not isinstance(source_sequence, int)
+            or source_sequence < 0
+        ):
+            raise ValueError("source_sequence must be a non-negative integer")
+        unity_sequence = source_sequence
+
+    unity_time = (
+        -1.0 if source_unity_time_s is None else float(source_unity_time_s)
+    )
+    python_time = (
+        time.monotonic() if python_time_s is None else float(python_time_s)
+    )
+    if (
+        not math.isfinite(unity_time)
+        or unity_time < -1.0
+        or not math.isfinite(python_time)
+        or python_time < 0.0
+    ):
+        raise ValueError("joint-state timestamps are invalid")
+
+    if (
+        not isinstance(mode, str)
+        or not mode
+        or len(mode) > 32
+        or not all(
+            character.isalnum() or character == "_" for character in mode
+        )
+        or not mode.isascii()
+    ):
+        raise ValueError("mode must be a short ASCII identifier")
+
+    try:
+        joints = tuple(float(value) for value in joints_rad)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("joints_rad must contain six finite angles") from exc
+    if len(joints) != 6 or not all(math.isfinite(value) for value in joints):
+        raise ValueError("joints_rad must contain six finite angles")
+
+    joint_text = ",".join(f"{value:.9f}" for value in joints)
+    return (
+        f"J1,{command_sequence},{unity_sequence},{unity_time:.6f},"
+        f"{python_time:.6f},{mode},{joint_text}\n"
+    )
+
+
+class UnityJointStatePublisher:
+    """Non-blocking latest-value publisher on the existing Unity TCP socket.
+
+    Robot control must never wait for Unity rendering or TCP backpressure.  A
+    daemon worker owns socket writes and a capacity-one slot replaces any
+    unsent older command with the newest accepted command.
+    """
+
+    def __init__(self, transport) -> None:
+        if not callable(getattr(transport, "sendall", None)):
+            raise TypeError("transport must provide sendall(bytes)")
+        self._transport = transport
+        self._condition = threading.Condition()
+        self._latest_payload: Optional[bytes] = None
+        self._next_sequence = 0
+        self._closed = False
+        self._failure: Optional[OSError] = None
+        self._thread = threading.Thread(
+            target=self._send_loop,
+            name="unity-aubo-joint-publisher",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def failure(self) -> Optional[OSError]:
+        with self._condition:
+            return self._failure
+
+    def publish(
+        self,
+        joints_rad: Sequence[float],
+        *,
+        source_sequence: Optional[int] = None,
+        source_unity_time_s: Optional[float] = None,
+        python_time_s: Optional[float] = None,
+        mode: str = "track",
+    ) -> Optional[int]:
+        with self._condition:
+            if self._closed:
+                return None
+            command_sequence = self._next_sequence
+            payload = format_joint_state_line(
+                command_sequence,
+                joints_rad,
+                source_sequence=source_sequence,
+                source_unity_time_s=source_unity_time_s,
+                python_time_s=python_time_s,
+                mode=mode,
+            ).encode("ascii")
+            self._next_sequence += 1
+            self._latest_payload = payload
+            self._condition.notify()
+            return command_sequence
+
+    def _send_loop(self) -> None:
+        while True:
+            with self._condition:
+                while self._latest_payload is None and not self._closed:
+                    self._condition.wait()
+                if self._closed:
+                    return
+                payload = self._latest_payload
+                self._latest_payload = None
+
+            try:
+                self._transport.sendall(payload)
+            except OSError as exc:
+                with self._condition:
+                    self._failure = exc
+                    self._latest_payload = None
+                    self._closed = True
+                    self._condition.notify_all()
+                return
+
+    def close(self, join_timeout_s: float = 0.2) -> None:
+        timeout = float(join_timeout_s)
+        if not math.isfinite(timeout) or timeout < 0.0:
+            raise ValueError("join_timeout_s must be non-negative")
+        with self._condition:
+            self._closed = True
+            self._latest_payload = None
+            self._condition.notify_all()
+        self._thread.join(timeout)
 
 
 def parse_controller_line(line):
@@ -198,6 +431,32 @@ def process_controller_sample(teleop, position, rotation, trigger_held):
     return None
 
 
+def create_tracker(robot, gripper, position_mapping):
+    """Build one tracker for either the simulator or the real AUBO backend."""
+
+    return VRTracker(
+        robot,
+        gripper,
+        rate=1.0 / ROBOT_COMMAND_RATE_HZ,
+        # smooth_step=0.15,
+        smooth_step=1,
+        # Direction selection and the configured motion scale are applied
+        # before tracker construction.
+        pos_mapping=position_mapping,
+        # Calibrate at low speed so J6 follows the operator's turn.
+        wrist_roll_axis=(1.0, 0.0, 0.0),
+        wrist_roll_sign=1.0,
+        max_joint_speed_rad_s=MAX_JOINT_SPEED_RAD_S,
+        max_cartesian_speed_m_s=MAX_CARTESIAN_SPEED_M_S,
+        # No per-direction workspace sphere: the TCP follows the hand offset
+        # without a maximum-travel cap, bounded only by joint/speed limits.
+        max_position_offset_m=None,
+        collision_checker=AuboI7CollisionChecker(
+            plane_z_m=UNITY_PLANE_ROBOT_Z_M,
+        ),
+    )
+
+
 def main():
     # Create a TCP socket to listen to Unity
     unity_ip = "127.0.0.1"
@@ -209,37 +468,49 @@ def main():
             client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print("Connected to Unity server")
 
-            # Initialize the teleoperation class
-            # rtde = RTDE("192.168.1.102")
-            rtde = RM65B("192.168.1.18", port=8080)
+            # Start with a local plant.  Hardware is connected only after the
+            # operator explicitly presses L in this terminal.
+            robot = SimulatedAuboI7()
+            real_robot_connected = False
+            joint_publisher = UnityJointStatePublisher(client_socket)
             try:
                 gripper = GripperRequest("130.215.216.42")
                 calibration_path = default_calibration_path()
                 try:
                     saved_calibration = load_calibration(calibration_path)
-                    position_mapping = saved_calibration.rotation_vr_to_robot
+                    position_mapping = align_front_back_and_left_right(
+                        saved_calibration.rotation_vr_to_robot,
+                        VR_TO_ROBOT_MOTION_SCALE,
+                    )
                     print(f"Loaded VR calibration: {calibration_path}")
                 except FileNotFoundError:
-                    position_mapping = (-1.0, -1.0, 1.0)
-                    print("No saved VR calibration; using legacy XYZ mapping.")
+                    position_mapping = align_front_back_and_left_right(
+                        LEGACY_POSITION_MAPPING,
+                        VR_TO_ROBOT_MOTION_SCALE,
+                    )
+                    print(
+                        "No saved VR calibration; using aligned front/back and "
+                        "left/right legacy mapping."
+                    )
                 except CalibrationError as exc:
-                    position_mapping = (-1.0, -1.0, 1.0)
+                    position_mapping = align_front_back_and_left_right(
+                        LEGACY_POSITION_MAPPING,
+                        VR_TO_ROBOT_MOTION_SCALE,
+                    )
                     print(
                         "CALIBRATION WARNING: saved calibration is invalid; "
-                        f"using legacy XYZ mapping: {exc}"
+                        "using aligned front/back and left/right legacy mapping: "
+                        f"{exc}"
                     )
-                teleop = VRTracker(
-                    rtde,
-                    gripper,
-                    rate=1.0 / ROBOT_COMMAND_RATE_HZ,
-                    #smooth_step=0.15,
-                    smooth_step=1,
-                    # 1:1 distance; flip horizontal axes to match the operator's
-                    # forward/left directions with the RM65 base frame.
-                    pos_mapping=position_mapping,
-                    # Calibrated so the RM65 wrist follows the operator's turn.
-                    wrist_roll_axis=(1.0, 0.0, 0.0),
-                    wrist_roll_sign=1.0,
+                teleop = create_tracker(robot, gripper, position_mapping)
+                initial_joints = robot.get_joint_values()
+                joint_publisher.publish(initial_joints, mode="sim_initial")
+                print(
+                    "SIMULATION MODE: no real AUBO connection has been opened."
+                )
+                print(
+                    "Press L in this terminal to connect the real AUBO i7; "
+                    "release the Trigger before switching."
                 )
                 limits_deg = [
                     (round(math.degrees(lower), 3), round(math.degrees(upper), 3))
@@ -262,8 +533,9 @@ def main():
                     )
                 else:
                     print(
-                        "CALIBRATION WARNING: console key input is unavailable; "
-                        "Q calibration cannot be started in this terminal."
+                        "HOTKEY WARNING: console key input is unavailable; "
+                        "L hardware connection and Q calibration cannot be "
+                        "started in this terminal."
                     )
 
                 receive_buffer = b""
@@ -271,6 +543,7 @@ def main():
                 frequency_reporter = StreamFrequencyReporter()
                 latest_sample = None
                 latest_sample_received_at = None
+                publisher_failure_reported = False
                 while True:
                     for key in key_reader.poll():
                         lower_key = key.lower()
@@ -298,7 +571,10 @@ def main():
                             try:
                                 save_calibration_atomic(calibration_path, result)
                                 teleop.set_position_mapping(
-                                    result.rotation_vr_to_robot
+                                    align_front_back_and_left_right(
+                                        result.rotation_vr_to_robot,
+                                        VR_TO_ROBOT_MOTION_SCALE,
+                                    )
                                 )
                             except (OSError, CalibrationError, RuntimeError) as exc:
                                 print(
@@ -323,6 +599,80 @@ def main():
                             else:
                                 print("VR calibration request cancelled.")
                             tracking_requires_release = True
+                        elif lower_key == "l":
+                            if real_robot_connected:
+                                print("The real AUBO i7 is already connected.")
+                                continue
+                            if calibrator.active or calibration_waiting_for_release:
+                                print(
+                                    "Finish or cancel VR calibration before "
+                                    "connecting the real AUBO i7."
+                                )
+                                continue
+
+                            # Freeze command generation before any potentially
+                            # blocking network handshake or backend replacement.
+                            if not teleop.paused:
+                                teleop.pause()
+                            tracking_requires_release = True
+                            print(
+                                "Connecting real AUBO i7 at "
+                                "192.168.127.128:30004..."
+                            )
+                            candidate_robot = None
+                            try:
+                                candidate_robot = AuboI7(
+                                    "192.168.127.128", port=30004
+                                )
+                                candidate_robot.start_servo_mode()
+                                candidate_joints = (
+                                    candidate_robot.get_joint_values()
+                                )
+                                candidate_teleop = create_tracker(
+                                    candidate_robot,
+                                    gripper,
+                                    teleop.position_mapping_matrix,
+                                )
+                            except Exception as exc:
+                                if candidate_robot is not None:
+                                    try:
+                                        candidate_robot.close()
+                                    except Exception as close_exc:
+                                        print(
+                                            "AUBO CLEANUP WARNING: "
+                                            f"{close_exc}"
+                                        )
+                                print(
+                                    "AUBO CONNECTION FAILED: remaining in "
+                                    f"simulation mode: {exc}"
+                                )
+                            else:
+                                previous_robot = robot
+                                robot = candidate_robot
+                                teleop = candidate_teleop
+                                real_robot_connected = True
+                                previous_robot.close()
+                                joint_publisher.publish(
+                                    candidate_joints,
+                                    mode="real_initial",
+                                )
+                                warning_reporter.clear()
+                                limits_deg = [
+                                    (
+                                        round(math.degrees(lower), 3),
+                                        round(math.degrees(upper), 3),
+                                    )
+                                    for lower, upper in teleop.joint_limits_rad
+                                ]
+                                print(
+                                    "REAL ROBOT MODE: AUBO servo mode enabled. "
+                                    "Release the Trigger, then press it again "
+                                    "to begin tracking."
+                                )
+                                print(
+                                    f"Using {teleop.joint_limit_source} joint "
+                                    f"limits (deg): {limits_deg}"
+                                )
 
                     now = time.monotonic()
                     readable, _, _ = select.select(
@@ -392,6 +742,16 @@ def main():
                     )
                     if frequency_message is not None:
                         print(frequency_message)
+                    publisher_failure = joint_publisher.failure
+                    if (
+                        publisher_failure is not None
+                        and not publisher_failure_reported
+                    ):
+                        print(
+                            "UNITY MIRROR WARNING: joint-state publishing failed; "
+                            f"robot control will continue: {publisher_failure}"
+                        )
+                        publisher_failure_reported = True
 
                     if (
                         calibration_waiting_for_release
@@ -426,6 +786,12 @@ def main():
                         repeated = teleop.keepalive()
                         if repeated is not None:
                             frequency_reporter.observe_robot_command()
+                            joint_publisher.publish(
+                                repeated,
+                                source_sequence=latest_sample.sequence_id,
+                                source_unity_time_s=latest_sample.unity_time_s,
+                                mode="keepalive_stale",
+                            )
                         continue
 
                     try:
@@ -439,24 +805,37 @@ def main():
                             print("Resuming decoupled joint teleoperation...")
                         if command is not None:
                             frequency_reporter.observe_robot_command()
+                            joint_publisher.publish(
+                                command,
+                                source_sequence=latest_sample.sequence_id,
+                                source_unity_time_s=latest_sample.unity_time_s,
+                                mode="track",
+                            )
                         if teleop.last_warning_reason is None:
                             warning_reporter.clear()
                         else:
                             warning_reporter.report(teleop.last_warning_reason)
                     except TeleoperationSafetyWarning as warning:
                         warning_reporter.report(warning)
-                        # CAN-FD pass-through expects a continuous stream.  A
+                        # AUBO servoJoint expects a continuous stream.  A
                         # held VR target must not create the old self-lock
                         # where low-follow feedback can never reach the last
                         # accepted target because command transmission stopped.
                         repeated = teleop.keepalive()
                         if repeated is not None:
                             frequency_reporter.observe_robot_command()
+                            joint_publisher.publish(
+                                repeated,
+                                source_sequence=latest_sample.sequence_id,
+                                source_unity_time_s=latest_sample.unity_time_s,
+                                mode="keepalive_safety",
+                            )
             finally:
                 # Disconnect only.  The teleoperation application deliberately
                 # does not request a slow stop; controller/teach-pendant safety
                 # logic remains authoritative.
-                rtde.close()
+                joint_publisher.close()
+                robot.close()
 
     except KeyboardInterrupt:
         print("Closing connection...")
