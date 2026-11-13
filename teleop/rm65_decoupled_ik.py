@@ -1,6 +1,10 @@
-"""Offline RM65-B kinematics and position-only, roll-decoupled IK.
+"""Offline RM65-6F-V kinematics and position-only, roll-decoupled IK.
 
-The kinematic constants in this module follow ``RM65-B/urdf/RM65-B.urdf``.
+The joint-frame convention follows the original RM65-B URDF, with the terminal
+link length replaced by RealMan's RM65-6F-V MDH value, d6 = 184 mm:
+https://develop.realman-robotics.com/robot4th/robotParameter/RM65OntologyParameters/
+The sensor/vision end structure is included in d6.  An active tool offset is
+relative to that flange and must not include the same structure a second time.
 Joints 1..5 solve only the TCP position task.  Joint 6 is held at a separately
 provided wrist-roll target and is never used by the position pseudoinverse.
 
@@ -22,6 +26,10 @@ import math
 from typing import Optional, Sequence
 
 import numpy as np
+
+
+# Official RM65-6F-V d6; the original RM65-B model used 0.144 m.
+RM65_D6_M = 0.184
 
 
 RM65_JOINT_LIMITS_RAD: tuple[tuple[float, float], ...] = (
@@ -47,7 +55,8 @@ _JOINT_ORIGIN_XYZ = np.asarray(
         (0.256, 0.0, 0.0),
         (0.0, -0.210, 0.0),
         (0.0, 0.0, 0.0),
-        (0.0, -0.144, 0.0),
+        # In these URDF joint frames, MDH d6 is along joint 5's local -Y.
+        (0.0, -RM65_D6_M, 0.0),
     ),
     dtype=np.float64,
 )
@@ -454,7 +463,7 @@ class IKResult:
 
 
 class RM65DecoupledIK:
-    """Local, continuity-preserving RM65 position IK with independent J6."""
+    """Local, continuity-preserving RM65-6F-V position IK with independent J6."""
 
     def __init__(
         self,
@@ -673,6 +682,7 @@ __all__ = (
     "IKOptions",
     "IKResult",
     "RM65DecoupledIK",
+    "RM65_D6_M",
     "RM65_JOINT_LIMITS_RAD",
     "RM65_NOMINAL_POSTURE_RAD",
     "continuous_wrist_roll_target",

@@ -21,6 +21,64 @@ class RM65KinematicsTests(unittest.TestCase):
     def setUp(self):
         self.nominal = np.asarray(RM65_NOMINAL_POSTURE_RAD)
 
+    @staticmethod
+    def official_rm65_6f_v_mdh(joints):
+        """Independent reference from RealMan's RM65-6F-V MDH table."""
+
+        # a_(i-1), alpha_(i-1), d_i, zero offset; metres and radians.
+        parameters = (
+            (0.0, 0.0, 0.2405, 0.0),
+            (0.0, math.pi / 2.0, 0.0, math.pi / 2.0),
+            (0.256, 0.0, 0.0, math.pi / 2.0),
+            (0.0, math.pi / 2.0, 0.210, 0.0),
+            (0.0, -math.pi / 2.0, 0.0, 0.0),
+            (0.0, math.pi / 2.0, 0.184, 0.0),
+        )
+        result = np.eye(4)
+        for joint, (a, alpha, d, offset) in zip(joints, parameters):
+            theta = joint + offset
+            ct, st = math.cos(theta), math.sin(theta)
+            ca, sa = math.cos(alpha), math.sin(alpha)
+            result = result @ np.asarray(
+                (
+                    (ct, -st, 0.0, a),
+                    (st * ca, ct * ca, -sa, -d * sa),
+                    (st * sa, ct * sa, ca, d * ca),
+                    (0.0, 0.0, 0.0, 1.0),
+                )
+            )
+        return result
+
+    def test_zero_joint_flange_height_includes_184_mm_end_link(self):
+        position = forward_kinematics(np.zeros(6))[:3, 3]
+        np.testing.assert_allclose(position, (0.0, 0.0, 0.8905), atol=1e-12)
+
+    def test_forward_kinematics_matches_official_rm65_6f_v_mdh(self):
+        configurations_deg = (
+            (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            (0.0, -75.0, 60.0, 0.0, 60.0, 0.0),
+            (15.0, -65.0, 72.0, 18.0, 55.0, -30.0),
+            (120.0, 40.0, -90.0, -60.0, -75.0, 270.0),
+        )
+        tool = np.asarray(
+            (
+                (0.0, -1.0, 0.0, 0.03),
+                (1.0, 0.0, 0.0, 0.02),
+                (0.0, 0.0, 1.0, 0.10),
+                (0.0, 0.0, 0.0, 1.0),
+            )
+        )
+        for configuration in configurations_deg:
+            joints = np.radians(configuration)
+            expected_flange = self.official_rm65_6f_v_mdh(joints)
+            for tcp in (np.eye(4), tool):
+                with self.subTest(joints_deg=configuration, tcp=tcp[:3, 3]):
+                    np.testing.assert_allclose(
+                        forward_kinematics(joints, tcp),
+                        expected_flange @ tcp,
+                        atol=1e-12,
+                    )
+
     def test_nominal_posture_has_full_geometric_rank(self):
         jacobian = geometric_jacobian(self.nominal)
         self.assertEqual(np.linalg.matrix_rank(jacobian, tol=1e-9), 6)
