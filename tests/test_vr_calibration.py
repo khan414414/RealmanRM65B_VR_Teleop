@@ -60,6 +60,27 @@ class PositionCalibrationTests(unittest.TestCase):
                 (0.0, 0.0, -0.12),
             )
 
+    def test_mirrored_and_swapped_axes_explain_handedness_failure(self):
+        _, center, endpoints = self.known_samples()
+        for bad_endpoints in (
+            (endpoints[0], center - (endpoints[1] - center), endpoints[2]),
+            (endpoints[1], endpoints[0], endpoints[2]),
+        ):
+            with self.subTest(endpoints=bad_endpoints):
+                with self.assertRaises(CalibrationError) as caught:
+                    solve_position_mapping(center, *bad_endpoints)
+                message = str(caught.exception)
+                self.assertIn("right-handed", message)
+                self.assertIn("三重积=-1.000", message)
+                self.assertIn("左手系", message)
+                self.assertIn("机器人基坐标", message)
+
+    def test_calibration_start_explains_robot_axes_and_common_handedness_mistake(self):
+        message = GuidedPositionCalibrator().start().message
+        self.assertIn("机器人基坐标", message)
+        self.assertIn("+X×+Y=+Z", message)
+        self.assertIn("+Y 应向左", message)
+
     def test_guided_sampling_rejects_motion_then_completes(self):
         expected, center, endpoints = self.known_samples()
         calibrator = GuidedPositionCalibrator(

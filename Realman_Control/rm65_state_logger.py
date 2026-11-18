@@ -30,9 +30,9 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 import numpy as np
-from Robotic_Arm import rm_robot_interface as rm
+from Realman_Control.legacy_sdk import RealtimeCallback
 
-from realman_control import RM65B
+from Realman_Control.realman_control import RM65B
 
 
 JOINT_COUNT = 6
@@ -159,7 +159,7 @@ class RM65StateLogger:
         return self._queue_overflow_count
 
     def _on_realtime_state(self, state: Any) -> None:
-        """Copy an SDK callback promptly; never let exceptions cross ctypes."""
+        """Copy the legacy by-value callback; do not let exceptions cross ctypes."""
 
         if not self._accept_callbacks:
             return
@@ -182,7 +182,7 @@ class RM65StateLogger:
                 mono_ns=mono_ns,
                 system_time_ns=system_time_ns,
                 sdk_error_code=int(state.errCode),
-                arm_current_status=int(state.arm_current_status),
+                arm_current_status=-1,  # Unavailable in the API 4.2.8 callback ABI.
                 joint_rad=joint_rad,  # type: ignore[arg-type]
                 tcp_position_base_m=(
                     float(position.x),
@@ -210,67 +210,42 @@ class RM65StateLogger:
             raise RuntimeError(f"{operation} failed with RealMan SDK code {code}")
 
     @staticmethod
-    def _push_config_from_dict(config: dict[str, Any]) -> Any:
-        custom_values = config.get("custom_config") or {}
-        custom = rm.rm_udp_custom_config_t(
-            joint_speed=int(custom_values.get("joint_speed", -1)),
-            lift_state=int(custom_values.get("lift_state", -1)),
-            expand_state=int(custom_values.get("expand_state", -1)),
-            arm_current_status=int(
-                custom_values.get("arm_current_status", -1)
-            ),
-            hand_state=int(custom_values.get("hand_state", -1)),
-            aloha_state=int(custom_values.get("aloha_state", -1)),
-            plus_base=int(custom_values.get("plus_base", -1)),
-            plus_state=int(custom_values.get("plus_state", -1)),
-        )
-        ip = config.get("ip", "")
+    def _push_config_from_dict(config: dict[str, Any]) -> dict[str, Any]:
+        ip = config["ip"]
         if isinstance(ip, bytes):
-            ip = ip.decode("utf-8")
-        return rm.rm_realtime_push_config_t(
-            cycle=int(config.get("cycle", 100)),
-            enable=bool(config.get("enable", False)),
-            port=int(config.get("port", 8080)),
-            force_coordinate=int(config.get("force_coordinate", -1)),
-            ip=str(ip),
-            custom_config=custom,
-        )
+            ip = ip.decode("ascii")
+        return {
+            "cycle": int(config["cycle"]),
+            "enable": bool(config["enable"]),
+            "port": int(config["port"]),
+            "force_coordinate": int(config.get("force_coordinate", -1)),
+            "ip": str(ip),
+        }
 
     def connect_and_start(self) -> None:
-        """Connect, preserve the old UDP configuration, and start callbacks."""
+        """Preserve the legacy UDP config and register the 4.2.8 callback ABI."""
 
         self._robot = RM65B(self.robot_ip, port=self.robot_port)
         arm = self._robot.arm
+        old_code, old_config = arm.Get_Realtime_Push()
+        self._check_sdk_code(old_code, "Get_Realtime_Push")
+        self._previous_push_config = self._push_config_from_dict(old_config)
 
-        old_code, old_config = arm.rm_get_realtime_push()
-        if int(old_code) == 0 and isinstance(old_config, dict):
-            self._previous_push_config = old_config
-        else:
-            print(
-                "Warning: could not read the previous realtime-push "
-                f"configuration (SDK code {old_code}).",
-                file=sys.stderr,
-            )
-
-        self._callback = rm.rm_realtime_arm_state_callback_ptr(
-            self._on_realtime_state
-        )
+        self._callback = RealtimeCallback(self._on_realtime_state)
         self._accept_callbacks = True
-        arm.rm_realtime_arm_state_call_back(self._callback)
+        arm.Realtime_Arm_Joint_State(self._callback)
 
-        custom = rm.rm_udp_custom_config_t(arm_current_status=1)
-        push_config = rm.rm_realtime_push_config_t(
-            cycle=self.cycle_ms,
-            enable=True,
-            port=self.udp_port,
-            force_coordinate=-1,
-            ip=self.local_ip,
-            custom_config=custom,
-        )
-        self._check_sdk_code(
-            arm.rm_set_realtime_push(push_config), "rm_set_realtime_push"
-        )
+        # The wire protocol cycle is a count of 5 ms ticks, not milliseconds.
+        push_config = {
+            "cycle": self.cycle_ms // 5,
+            "enable": True,
+            "port": self.udp_port,
+            "force_coordinate": -1,
+            "ip": self.local_ip,
+        }
+        # Restore even if the controller applied the setting but its reply was lost.
         self._configured_push = True
+        self._check_sdk_code(arm.Set_Realtime_Push(push_config), "Set_Realtime_Push")
 
     def _add_timing(self, sample: RawStateSample) -> StoredStateSample:
         if self._first_mono_ns is None:
@@ -384,25 +359,9 @@ class RM65StateLogger:
 
         try:
             arm = self._robot.arm
-            if self._previous_push_config is not None:
-                restore_config = self._push_config_from_dict(
-                    self._previous_push_config
-                )
-            elif self._configured_push:
-                custom = rm.rm_udp_custom_config_t(arm_current_status=1)
-                restore_config = rm.rm_realtime_push_config_t(
-                    cycle=self.cycle_ms,
-                    enable=False,
-                    port=self.udp_port,
-                    force_coordinate=-1,
-                    ip=self.local_ip,
-                    custom_config=custom,
-                )
-            else:
-                restore_config = None
-
-            if restore_config is not None:
-                code = arm.rm_set_realtime_push(restore_config)
+            if self._configured_push and self._previous_push_config is not None:
+                code = arm.Set_Realtime_Push(self._previous_push_config)
+                self._configured_push = False
                 if int(code) != 0:
                     print(
                         "Warning: failed to restore the realtime-push "

@@ -1,8 +1,12 @@
-# RM65-B VR Teleoperation
+# RM65-BI VR Teleoperation (firmware 1.4.x)
+
+`RM65BI` 分支以 `main` 的 `c255c15` 为基础，适配无需升级固件的 RM65-BI 1.4.x 控制器。控制连接使用 **API 4.2.8** 的旧版版本查询协议；仓库包含经 SHA-256 校验的 Windows 64 位 DLL，来源见 [vendor/README.md](Realman_Control/vendor/README.md)。
+
+现有 `RM65B` 类名仍作为兼容别名。`Robotic_Arm==1.1.6` 保留用于离线奇异点和自碰撞预测；控制器连接、状态读取、规划运动和 CAN-FD 透传全部由 API 4.2.8 完成。
 
 使用 VR/XR 手柄遥操作睿尔曼 RealMan RM65-B 六轴机械臂，并记录实机关节状态和末端位姿。
 
-本项目改造自原始 `UR10_Teleop`：Unity 端继续负责读取手柄数据，Python 端已切换为通过 RealMan Python API2 控制 RM65-B。仓库中的 `UR10_RTDE` 目录仅作为原始接口参考，当前遥操作入口不会使用 UR10 RTDE 控制机械臂。
+本项目改造自原始 `UR10_Teleop`：Unity 端继续负责读取手柄数据，Python 端通过 RealMan API 4.2.8 控制 RM65-BI。仓库中的 `UR10_RTDE` 目录仅作为原始接口参考，当前遥操作入口不会使用 UR10 RTDE 控制机械臂。
 
 ## 安全警告
 
@@ -32,8 +36,8 @@ Python: teleop/vr_teleop.py
 VRTracker / RM65DecoupledIK
     ↓ J1～J5 位置逆解，J6 独立腕转
     ↓ servo_joint()
-RM65B / RealMan Python API2
-    ↓ rm_movej_canfd()
+RM65BI / RealMan API 4.2.8
+    ↓ Movej_CANFD()
 RM65-B 控制器与实机
 ```
 
@@ -42,7 +46,8 @@ RM65-B 控制器与实机
 ```text
 VR-Teleop/                         Unity VR 输入与 TCP 服务端
 teleop/                            遥操作数据解析、映射和夹爪请求
-Realman_Control/realman_control.py RM65-B API2 控制封装
+Realman_Control/realman_control.py RM65-BI 旧版 SDK 控制封装
+Realman_Control/legacy_sdk.py     RealMan API 4.2.8 的类型化 C 接口绑定
 Realman_Control/rm65_state_logger.py
                                    实机状态 CSV/NPZ 记录器
 UR10_RTDE/                         原始 UR10 参考代码，当前入口不使用
@@ -82,7 +87,8 @@ UR10_RTDE/                         原始 UR10 参考代码，当前入口不使
 
 - Windows 10/11
 - Conda 环境 `VRControl`，Python 3.12
-- RealMan Python API2：`Robotic_Arm`
+- 控制 SDK：仓库自带的 RealMan API 4.2.8（Windows 64 位 DLL）
+- 离线安全算法：`Robotic_Arm==1.1.6`，仅使用 `Algo`，不建立 API2 连接
 - NumPy、SciPy、Requests
 - Unity `6000.5.6f1`，或能够兼容打开该工程的 Unity 版本
 - Meta Quest Link 和 OpenXR Runtime（使用 Quest 时）
@@ -99,13 +105,13 @@ conda activate VRControl
 安装 Python 依赖：
 
 ```powershell
-python -m pip install numpy scipy requests Robotic_Arm
+python -m pip install -r requirements-rm65bi.txt
 ```
 
 确认所有依赖来自当前 Conda 环境：
 
 ```powershell
-python -c "import numpy, scipy, requests, urllib3; from Robotic_Arm import rm_robot_interface; print(requests.__file__)"
+python -c "import numpy, scipy, requests, urllib3; from Robotic_Arm.rm_robot_interface import Algo; print(requests.__file__)"
 ```
 
 路径应位于：
@@ -134,6 +140,22 @@ Test-NetConnection 192.168.1.18 -Port 8080
 ```
 
 端口测试中的 `TcpTestSucceeded` 应为 `True`。本项目不会自动完成机械臂上电、清错或使能。
+
+## RM65-BI 连接自检
+
+安装依赖后，先执行只读检查，无需启动 Unity：
+
+```powershell
+python -m Realman_Control.check_connection
+```
+
+自检读取型号、版本、关节角、示教器限位、TCP 和工具坐标系，并初始化离线安全算法。它只断开连接，不发送运动、慢停、清错、使能或固件升级命令。确认成功后按原流程启动 Unity，再执行：
+
+```powershell
+python -m teleop.vr_teleop
+```
+
+旧 SDK 不提供新版 `trajectory_mode`/`radio` 透传滤波参数，二者只接受 `0`；现有遥操作仍由本地控制器按固定周期生成目标。`speed_tool()` 笛卡尔速度透传和非零 `blend_percent` 会明确报不支持。
 
 ## Unity 与 Quest 设置
 
@@ -198,6 +220,8 @@ Trigger 建立的相对锚点只负责“重新归零”，不属于坐标方向
 8. 按 `Y` 保存并立即启用；按 `R` 清除本轮样本并重做；按 `Esc` 取消并保留原映射。
 9. 标定完成或取消后，先确认 Trigger 已释放，再重新按住 Trigger 建立新的跟随锚点。
 
+三轴正方向必须以机器人基坐标为准，满足右手规则 `+X × +Y = +Z`。例如把 `+X` 定义为向前、`+Z` 定义为向上时，`+Y` 应向左，不能直接将“前、右、上”当作 `+X/+Y/+Z`。`sampled axes are not a clear right-handed` 表示三轴组合未通过右手性检查；程序会显示归一化三重积。负值表示方向组合构成左手系，常见原因是某轴正负方向取反或采样顺序交换。应结合报错后的四个采样位置及实际移动方向核对，而不是直接翻转某一轴来通过检查。
+
 标定矩阵是正交旋转矩阵，因此不会改变 `1:1` 距离比例。结果会原子写入 `config/vr_position_calibration.json`，下次启动自动校验并加载；文件缺失或损坏时使用旧的固定映射 `diag(-1,-1,1)`。重置 XR Guardian/边界、重新定向 XR Origin、移动 VR 基站或修改 Unity 坐标转换后，应重新标定。
 
 该流程只标定 XYZ 平移方向，不标定机器人关节零位、TCP、负载或 J6 腕转符号；这些仍分别以示教器配置和 `wrist_roll_sign` 为准。标定期间程序不发送新的 `servo_joint` 目标，也不发送慢停命令，物理保持、减速或停机由 RM65 控制器与示教器决定。
@@ -250,7 +274,7 @@ Pausing command generation...
 1. 松开食指扳机暂停跟随。
 2. 通过示教器停止机械臂并确认其状态。
 3. 在 Python 终端按 `Ctrl+C`。
-4. Python 只断开 API2 连接，不发送慢停命令。
+4. Python 只断开 API 4.2.8 连接，不发送慢停命令。
 5. 停止 Unity Play 模式。
 
 ## 记录 RM65-B 实机状态
@@ -341,7 +365,8 @@ $env:PYTHONNOUSERSITE="1"
 - 电脑和机械臂是否处于同一网段
 - TCP 8080 是否可达
 - 急停、报警、上电和使能状态是否正常
-- RealMan Python API2 是否安装在当前 Conda 环境
+- 是否使用 Windows 64 位 Python，以及仓库内的 API 4.2.8 DLL 是否完整
+- `Robotic_Arm==1.1.6` 是否可用于离线安全计算；不要用其 `RoboticArm` 类连接 1.4.x 控制器
 
 ### `joint target is near a shoulder singularity`
 
@@ -350,6 +375,8 @@ $env:PYTHONNOUSERSITE="1"
 ### 状态记录器收不到数据
 
 手动传入正确的 `--local-ip`，并允许 Python 通过 Windows 防火墙接收 UDP 8089。`--local-ip` 必须是电脑网卡地址，不能填写机械臂 IP。
+
+旧版 UDP 回调没有 `arm_current_status`，状态记录器将该列写为 `-1`（未知），不伪装成空闲状态。`--cycle-ms` 仍表示毫秒，内部转换为控制器使用的 5 ms 周期计数；例如 `20 ms` 对应 `cycle=4`。记录器读取并保存原始 UDP 配置，退出时恢复。
 
 ## 控制接口说明
 
@@ -363,16 +390,56 @@ $env:PYTHONNOUSERSITE="1"
 - `servo_joint()`：CAN-FD 关节位置透传
 - `servo_tool()`：CAN-FD 末端位姿透传，保留给其他调用者
 - `stop()`：机械臂慢停
-- `close()`：断开 API2 连接
+- `close()`：断开 API 4.2.8 连接
 
-RealMan API2 内部使用关节角度制和欧拉角，封装会在接口边界完成转换。
+RealMan API 4.2.8 内部使用关节角度制和欧拉角，封装会在接口边界完成转换。
 
 当前 VR 遥操作使用 `RM65DecoupledIK` 后调用 `servo_joint()`，不再使用 `servo_tool()` 的完整六维位姿逆解。六关节目标会在发送前逐项裁剪到示教器可动范围内的安全区间：J1～J5 距离上下限各保留 `5°`，J6 各保留 `15°`。程序只保留最新 VR 意图，不建立逐帧 FIFO，因此新鲜的新帧会替换旧目标，松开 Trigger 会清除待跟随目标。工作区外的 XYZ 会投影到工作区球面；非收敛但确实同时接近本周期子目标和最终目标的局部 IK 解，会在关节步长及实际 FK 笛卡尔步长都限速后逐周期发送。单帧超过 `45°` 的手柄腕转会在多个控制周期内分段吸收，J6 输出仍受 `90 deg/s` 上限约束。完整候选接近奇异或自碰撞时，再尝试一个 `2.5%` 的小步；只有仍通过关节余量、实际笛卡尔步长、本地奇异性和厂商奇异/自碰撞检查的候选才会发送。若没有安全的正向步长，程序打印 `SAFETY WARNING` 并重发上一安全目标，不请求机械臂慢停。following error 会把反馈与最近 `0～150 ms` 命令包络比较，兼容低跟随延迟和快速跟随；真实误差超阈值时仍冻结命令，让机械臂追上当前目标，同时保留最新 VR 意图，误差恢复后再继续逼近。最终保护停机、超时保持和急停行为由 RM65 控制器及示教器决定。
+
+## 手柄位移比例排查
+
+若实际平移 12 cm，但标定只测到约 3 cm，可使用独立的分层诊断。该程序只连接 Unity，不导入机器人 SDK，也不发送机器人命令。
+
+1. 退出 `teleop.vr_teleop`，在当前仓库的 `VR-Teleop` 项目中重新进入 Play，确保新版发送脚本已经编译。
+2. 运行：
+
+```powershell
+python -m teleop.vr_pose_diagnostics
+```
+
+3. 手柄放在尺子的起点，在诊断终端按 Enter 或 R 归零，再平移 12 cm，保持静止约 2 秒。
+
+程序对比 XR 原始位置、Unity 局部位置、Unity 世界位置、Unity 发送位置和 Python 接收位置，同时显示父级累计缩放、跟踪状态和实际 Unity 项目路径。原始运动记录仍保持 11 字段；新增 `#VR_DIAG` 行每秒最多约 4 条，遥操作接收端会跳过这些诊断行。
+
+诊断还会记录 Position、Rotation 等输入动作实际使用的设备和右手设备列表；`XRNode.RightHand` 返回的设备不一定就是驱动位置输入的设备，不能只根据该接口的设备名称判断输入来源。只有原始位置有效、`isTracked=true` 且跟踪状态包含位置有效位时，才计算原始位移比例。
+
+发送端仅接受右手实体 Touch 系列手柄的位置和旋转，要求两者来自同一设备、`isTracked=true`，并同时具有位置和旋转有效位。手部跟踪、丢失跟踪或设备不一致时，发送 `#VR_INPUT_INVALID` 状态行，停止发送运动采样。Python 会清除待跟随目标、暂停遥操作并取消本轮标定，保留已保存的标定；恢复有效跟踪并松开 Trigger 后才可再次跟随。需要重新按 Q 开始标定。该检查保留原来的坐标映射和距离比例。
+
+- XR 原始位移约 12 cm、世界位移约 3 cm：重点检查父级 Transform 或运行时位置处理。
+- XR 原始位移也约 3 cm：继续检查 XR 跟踪源、设备选择和采样时机。
+- Unity 发送位移约 12 cm、Python 接收位移约 3 cm：检查接收的是哪份 Unity 项目、帧序号与日志。
+
+诊断原始记录默认保存在 `.log_analysis/vr_pose_diagnostics_*.jsonl`。
+
+## RM65BI 分支验证
+
+2026-11-18 在当前 RM65-BI 实机上通过 API 4.2.8 完成只读连接检查：版本、关节角、关节限位、TCP、工具坐标系均可正常读取；离线安全算法可正常初始化。
+
+SDK 相关测试共 30 项通过，包含真实 DLL 与本地模拟控制器之间的旧版握手、关节/位姿透传单位、UDP 周期及异常清理测试。实际机械臂上未执行运动测试。
+
+全量测试为 98 项，其中 89 项通过，9 项 VR 跟踪测试失败；在未修改的 `main`（`c255c15`）副本上复现了相同的 9 项失败，无新增失败或导入错误。本次未修改 `vr_tracker.py` 的跟踪参数或控制逻辑。Unity 只读实测确认：正常跟踪的 Touch 数据可以通过；丢失跟踪或切换到手部跟踪时，发送无效状态并拦截运动采样。
+
+```powershell
+python -m unittest discover -s tests -p test_realman_control.py
+python -m unittest discover -s tests -p test_legacy_sdk.py
+python -m unittest discover -s tests -p test_rm65_state_logger.py
+```
 
 ## 参考资料
 
 - [RealMan Robotics 开发者文档](https://develop.realman-robotics.com/robot/summarize/)
-- [RealMan Python API2 入门](https://develop.realman-robotics.com/robot/apipython/getStarted/)
+- [RealMan API 4.2.8 官方示例与 SDK 附件](https://bbs.realman-robotics.cn/question/316.html)
+- [API2 离线算法参考](https://develop.realman-robotics.com/robot/apipython/classes/algo/)
 - [Unity 官方网站](https://unity.com/)
 - [Meta Quest Link 设置](https://www.meta.com/help/quest/articles/headsets-and-accessories/oculus-link/connect-with-air-link/)
 

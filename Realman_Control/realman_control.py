@@ -1,4 +1,4 @@
-"""RM65-B control wrapper built on RealMan Python API2.
+"""RM65-BI control wrapper for 1.4.x firmware, using RealMan API 4.2.8.
 
 The public pose and joint conventions intentionally match ``UR10_RTDE/rtde``
 so this class can be used by the existing teleoperation layer:
@@ -7,19 +7,20 @@ so this class can be used by the existing teleoperation layer:
 * Cartesian pose: ``[x, y, z, rx, ry, rz]`` in metres and rotation-vector
   radians
 
-RealMan API2 uses joint degrees and XYZ Euler angles.  This module performs the
+RealMan API 4.2.8 uses joint degrees and XYZ Euler angles.  This module performs the
 conversion at the boundary.  Planned moves use RealMan's percentage speed,
 while online joint/pose servoing uses the CAN-FD pass-through interfaces.
 
-Official API reference:
-https://develop.realman-robotics.com/robot/apipython/getStarted/
-https://develop.realman-robotics.com/robot/apipython/classes/movePlan/
+API2 is used only through its offline Algo class for predictive safety checks.
+All controller communication goes through the legacy SDK; see vendor/README.md.
 """
 
 from __future__ import annotations
 
 import math
 from typing import Any, Optional, Sequence
+
+from Realman_Control.legacy_sdk import LegacyArm
 
 try:
     from Robotic_Arm import rm_robot_interface as _rm
@@ -31,28 +32,29 @@ else:
 
 
 class RealManError(RuntimeError):
-    """An error code returned by RealMan API2."""
+    """An integer error code returned by the RealMan legacy SDK."""
 
     def __init__(self, operation: str, code: int):
         self.operation = operation
         self.code = code
-        super().__init__(f"{operation} failed with RealMan API2 error code {code}")
+        super().__init__(f"{operation} failed with RealMan API 4.2.8 error code {code}")
 
 
 class RealmanControl:
-    """Control a six-axis RealMan RM65-B through Python API2.
+    """Control a six-axis RM65-BI without upgrading its 1.4.x firmware.
 
     Parameters
     ----------
     robot_ip:
         IP address of the robot controller.
     port:
-        API2 controller port.  RealMan examples use port 8080.
+        Controller port. RealMan examples use port 8080.
     log_level:
-        SDK log level: 0 debug, 1 info, 2 warning, 3 error.
+        Retained for caller compatibility; the legacy C binding emits no Python logs.
     thread_mode:
-        Optional SDK ``rm_thread_mode_e`` value.  Triple-thread mode is used by
-        default so asynchronous SDK data can be received.
+        Must be None; API 4.2.8 manages its own threads.
+    timeout_ms:
+        TCP connection timeout passed to Arm_Socket_Start, in milliseconds.
     """
 
     JOINT_COUNT = 6
@@ -75,13 +77,8 @@ class RealmanControl:
         port: int = DEFAULT_PORT,
         log_level: int = 3,
         thread_mode: Any = None,
+        timeout_ms: int = 1000,
     ) -> None:
-        if _rm is None:
-            raise RuntimeError(
-                "RealMan Python API2 is not installed. Install it with "
-                "`pip install Robotic_Arm`."
-            ) from _SDK_IMPORT_ERROR
-
         if not robot_ip:
             raise ValueError("robot_ip must not be empty")
         if not 0 < int(port) <= 65535:
@@ -89,36 +86,69 @@ class RealmanControl:
         if int(log_level) not in range(4):
             raise ValueError("log_level must be 0, 1, 2, or 3")
 
-        if thread_mode is None:
-            thread_mode = _rm.rm_thread_mode_e.RM_TRIPLE_MODE_E
+        if thread_mode is not None:
+            raise ValueError("thread_mode is not supported by API 4.2.8")
+        if int(timeout_ms) <= 0:
+            raise ValueError("timeout_ms must be positive")
 
         self.robot_ip = robot_ip
         self.port = int(port)
-        self._arm = _rm.RoboticArm(thread_mode)
-        self._handle = self._arm.rm_create_robot_arm(
-            self.robot_ip, self.port, int(log_level)
-        )
+        self._arm = LegacyArm(self.robot_ip, self.port, int(timeout_ms))
         self._closed = False
-        self._velocity_stream_config: Optional[tuple[int, int, int]] = None
+        self._algo = None
+        self._tool_frame = None
         self._joint_limits = tuple(self.JOINT_LIMITS)
-
-        handle_id = getattr(self._handle, "id", -1)
-        if handle_id < 0:
-            self._closed = True
-            try:
-                self._arm.rm_delete_robot_arm()
-            finally:
-                raise ConnectionError(
-                    f"Failed to connect to RM65-B at {self.robot_ip}:{self.port}; "
-                    f"SDK handle id is {handle_id}"
-                )
 
     @property
     def arm(self) -> Any:
-        """Return the underlying ``RoboticArm`` object for advanced API2 use."""
+        """Return the underlying LegacyArm binding (API 4.2.8 method names)."""
 
         self._require_open()
         return self._arm
+
+    def get_software_info(self) -> dict[str, str]:
+        """Read controller versions through the legacy, supported command."""
+
+        self._require_open()
+        code, info = self._arm.Get_Arm_Software_Version()
+        self._check_code(code, "Get_Arm_Software_Version")
+        return info
+
+    def _safety_algo(self):
+        """Create an offline RM65-B algorithm instance; never open an API2 socket."""
+
+        if self._algo is None:
+            if _rm is None:
+                raise RuntimeError(
+                    "Predictive safety checks require Robotic_Arm==1.1.6 "
+                    "(offline Algo only). Install requirements-rm65bi.txt."
+                ) from _SDK_IMPORT_ERROR
+            if self._tool_frame is None:
+                self.get_active_tool_frame_pose_euler()
+            self._algo = _rm.Algo(
+                _rm.rm_robot_arm_model_e.RM_MODEL_RM_65_E,
+                _rm.rm_force_type_e.RM_MODEL_RM_B_E,
+            )
+            self._sync_safety_limits()
+            self._sync_safety_tool()
+        return self._algo
+
+    def _sync_safety_tool(self):
+        if self._algo is not None and self._tool_frame is not None:
+            frame = self._tool_frame
+            self._algo.rm_algo_set_toolframe(_rm.rm_frame_t(
+                frame.name.decode("utf-8"), frame.pose.to_euler(), frame.payload,
+                frame.x, frame.y, frame.z,
+            ))
+
+    def _sync_safety_limits(self):
+        if self._algo is not None:
+            self._algo.rm_algo_set_joint_min_limit(
+                [math.degrees(lower) for lower, _ in self._joint_limits]
+            )
+            self._algo.rm_algo_set_joint_max_limit(
+                [math.degrees(upper) for _, upper in self._joint_limits]
+            )
 
     @staticmethod
     def _vector(values: Sequence[float], length: int, name: str) -> list[float]:
@@ -146,6 +176,8 @@ class RealmanControl:
         result = int(round(float(value)))
         if not 0 <= result <= 100:
             raise ValueError("blend_percent must be in the range 0..100")
+        if result != 0:
+            raise NotImplementedError("API 4.2.8 supports only blend_percent=0 here")
         return result
 
     def _joint_targets(
@@ -242,8 +274,8 @@ class RealmanControl:
         """Return the six joint positions in radians."""
 
         self._require_open()
-        code, joint_degrees = self._arm.rm_get_joint_degree()
-        self._check_code(code, "rm_get_joint_degree")
+        code, joint_degrees = self._arm.Get_Joint_Degree()
+        self._check_code(code, "Get_Joint_Degree")
         joints = self._vector(joint_degrees, self.JOINT_COUNT, "joint state")
         return [math.radians(value) for value in joints]
 
@@ -251,16 +283,16 @@ class RealmanControl:
         """Read and cache the controller's configured joint position limits.
 
         These are the software limits shown/configured through the RealMan
-        teach pendant.  API2 returns degrees; the wrapper exposes radians.
+        teach pendant. The legacy SDK returns degrees; this wrapper exposes radians.
         Subsequent motion validation uses this cached controller value rather
         than the model fallback in :attr:`JOINT_LIMITS`.
         """
 
         self._require_open()
-        min_code, minimum_degrees = self._arm.rm_get_joint_min_pos()
-        self._check_code(min_code, "rm_get_joint_min_pos")
-        max_code, maximum_degrees = self._arm.rm_get_joint_max_pos()
-        self._check_code(max_code, "rm_get_joint_max_pos")
+        min_code, minimum_degrees = self._arm.Get_Joint_Min_Pos()
+        self._check_code(min_code, "Get_Joint_Min_Pos")
+        max_code, maximum_degrees = self._arm.Get_Joint_Max_Pos()
+        self._check_code(max_code, "Get_Joint_Max_Pos")
         minimum = self._vector(
             minimum_degrees, self.JOINT_COUNT, "controller joint minimums"
         )
@@ -278,26 +310,23 @@ class RealmanControl:
                     f"{minimum[index - 1]:.3f}..{maximum[index - 1]:.3f} deg"
                 )
         self._joint_limits = limits
+        self._sync_safety_limits()
         return tuple(limits)
 
     def get_joint_speed(self) -> list[float]:
-        """Explain why synchronous API2 cannot provide joint velocity here."""
+        """The legacy binding does not expose synchronous joint velocity."""
 
         raise NotImplementedError(
-            "RealMan API2 exposes joint speed through the configured UDP realtime "
-            "push callback (joint_status.joint_speed), not through the synchronous "
-            "state query used by this wrapper."
+            "API 4.2.8 does not expose joint velocity through this binding."
         )
 
     def get_tool_pose(self) -> list[float]:
         """Return TCP pose as metres plus a rotation vector in radians."""
 
         self._require_open()
-        code, state = self._arm.rm_get_current_arm_state()
-        self._check_code(code, "rm_get_current_arm_state")
-        if not isinstance(state, dict) or "pose" not in state:
-            raise RuntimeError("rm_get_current_arm_state returned no pose")
-        return self._from_realman_pose(state["pose"])
+        code, _, pose, _, _ = self._arm.Get_Current_Arm_State()
+        self._check_code(code, "Get_Current_Arm_State")
+        return self._from_realman_pose(pose)
 
     def get_active_tool_frame_pose_euler(self) -> list[float]:
         """Return the active flange-to-TCP offset as XYZ plus XYZ Euler angles.
@@ -308,11 +337,11 @@ class RealmanControl:
         """
 
         self._require_open()
-        code, frame = self._arm.rm_get_current_tool_frame()
-        self._check_code(code, "rm_get_current_tool_frame")
-        if not isinstance(frame, dict) or "pose" not in frame:
-            raise RuntimeError("rm_get_current_tool_frame returned no pose")
-        return self._vector(frame["pose"], 6, "active tool frame pose")
+        code, frame = self._arm.Get_Current_Tool_Frame()
+        self._check_code(code, "Get_Current_Tool_Frame")
+        self._tool_frame = frame
+        self._sync_safety_tool()
+        return self._vector(frame.pose.to_euler(), 6, "active tool frame pose")
 
     def validate_joint_target(
         self,
@@ -333,14 +362,15 @@ class RealmanControl:
         if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
             raise ValueError("singular_value_limit must be in (0, 1)")
         joint_degrees = [math.degrees(value) for value in joints]
+        algo = self._safety_algo()
 
         singular = int(
-            self._arm.rm_algo_universal_singularity_analyse(
+            algo.rm_algo_universal_singularity_analyse(
                 joint_degrees, threshold
             )
         )
         if singular == -1:
-            kind, distance = self._arm.rm_algo_kin_robot_singularity_analyse(
+            kind, distance = algo.rm_algo_kin_robot_singularity_analyse(
                 joint_degrees
             )
             labels = {-1: "shoulder", -2: "elbow", -3: "wrist"}
@@ -357,7 +387,7 @@ class RealmanControl:
 
         if check_self_collision:
             collision = int(
-                self._arm.rm_algo_safety_robot_self_collision_detection(
+                algo.rm_algo_safety_robot_self_collision_detection(
                     joint_degrees
                 )
             )
@@ -371,10 +401,10 @@ class RealmanControl:
         return 0
 
     def get_tool_speed(self) -> list[float]:
-        """Report that API2 has no equivalent synchronous TCP-speed query."""
+        """The legacy binding has no equivalent synchronous TCP-speed query."""
 
         raise NotImplementedError(
-            "RealMan API2 does not provide a synchronous TCP-speed query equivalent "
+            "RealMan API 4.2.8 does not provide a synchronous TCP-speed query equivalent "
             "to UR RTDE getActualTCPSpeed()."
         )
 
@@ -395,10 +425,12 @@ class RealmanControl:
         self._require_open()
         if not tool_name or len(tool_name.encode("utf-8")) > 10:
             raise ValueError("tool_name must contain 1..10 UTF-8 bytes")
-        if float(payload) < 0.0:
-            raise ValueError("payload must be non-negative")
+        if not math.isfinite(float(payload)) or float(payload) < 0.0:
+            raise ValueError("payload must be finite and non-negative")
         cog = self._vector(center_of_mass, 3, "center_of_mass")
-        frame = _rm.rm_frame_t(
+        self._checked_call(
+            "Manual_Set_Tool_Frame",
+            self._arm.Manual_Set_Tool_Frame,
             tool_name,
             self._to_realman_pose(tcp),
             float(payload),
@@ -406,13 +438,11 @@ class RealmanControl:
             cog[1],
             cog[2],
         )
-        self._checked_call(
-            "rm_set_manual_tool_frame", self._arm.rm_set_manual_tool_frame, frame
-        )
         if activate:
             self._checked_call(
-                "rm_change_tool_frame", self._arm.rm_change_tool_frame, tool_name
+                "Change_Tool_Frame", self._arm.Change_Tool_Frame, tool_name
             )
+            self.get_active_tool_frame_pose_euler()
         return 0
 
     def move_joint(
@@ -427,15 +457,15 @@ class RealmanControl:
         Joint targets are radians.  RealMan accepts a 1..100 speed/acceleration
         percentage rather than separate physical speed and acceleration values;
         therefore ``acceleration`` is accepted for interface compatibility but
-        has no separate API2 mapping.
+        has no separate SDK mapping.
         """
 
         del acceleration
         joints = self._joint_targets(joint_values)
         joint_degrees = [math.degrees(value) for value in joints]
         return self._checked_call(
-            "rm_movej",
-            self._arm.rm_movej,
+            "Movej_Cmd",
+            self._arm.Movej_Cmd,
             joint_degrees,
             self._percentage(speed_percent, "speed_percent"),
             0,
@@ -462,8 +492,8 @@ class RealmanControl:
             joint_degrees = [math.degrees(value) for value in joints]
             is_last = index == len(points) - 1
             self._checked_call(
-                "rm_movej",
-                self._arm.rm_movej,
+                "Movej_Cmd",
+                self._arm.Movej_Cmd,
                 joint_degrees,
                 speed,
                 0 if is_last else blend,
@@ -482,7 +512,7 @@ class RealmanControl:
 
         del speeds, acceleration, time
         raise NotImplementedError(
-            "RM65-B API2 has no direct equivalent of UR speedJ. Use planned "
+            "RM65-B API 4.2.8 has no direct equivalent of UR speedJ. Use planned "
             "joint targets or generate safe position targets for servo_joint()."
         )
 
@@ -497,8 +527,8 @@ class RealmanControl:
 
         del acceleration
         return self._checked_call(
-            "rm_movel",
-            self._arm.rm_movel,
+            "Movel_Cmd",
+            self._arm.Movel_Cmd,
             self._to_realman_pose(pose),
             self._percentage(speed_percent, "speed_percent"),
             0,
@@ -523,8 +553,8 @@ class RealmanControl:
         for index, point in enumerate(points):
             is_last = index == len(points) - 1
             self._checked_call(
-                "rm_movel",
-                self._arm.rm_movel,
+                "Movel_Cmd",
+                self._arm.Movel_Cmd,
                 self._to_realman_pose(point),
                 speed,
                 0 if is_last else blend,
@@ -542,6 +572,10 @@ class RealmanControl:
         upper_limit = 1000 if mode == 2 else 100
         if not 0 <= parameter <= upper_limit:
             raise ValueError(f"radio must be in the range 0..{upper_limit}")
+        if mode != 0 or parameter != 0:
+            raise NotImplementedError(
+                "API 4.2.8 has no trajectory_mode/radio filter; use both as 0"
+            )
         return mode, parameter
 
     def speed_tool(
@@ -549,55 +583,13 @@ class RealmanControl:
         speeds: Sequence[float],
         acceleration: float = 0.25,
         time: float = 0.01,
-        *,
-        avoid_singularity: bool = True,
-        frame_type: int = 1,
-        high_follow: bool = False,
-        trajectory_mode: int = 0,
-        radio: int = 0,
+        **options: Any,
     ) -> int:
-        """Send one Cartesian-velocity pass-through sample.
+        """API 4.2.8/1.4.x has no Cartesian-velocity streaming command."""
 
-        Call this method repeatedly at ``time`` intervals.  Linear values are
-        m/s and angular values rad/s.  API2 limits are enforced before sending.
-        ``frame_type`` is 1 for the work frame and 0 for the tool frame.
-        """
-
-        del acceleration
-        velocity = self._vector(speeds, 6, "speeds")
-        if any(abs(value) > self.MAX_LINEAR_SPEED for value in velocity[:3]):
-            raise ValueError(
-                f"linear speed magnitude per axis must not exceed "
-                f"{self.MAX_LINEAR_SPEED} m/s"
-            )
-        if any(abs(value) > self.MAX_ANGULAR_SPEED for value in velocity[3:]):
-            raise ValueError(
-                f"angular speed magnitude per axis must not exceed "
-                f"{self.MAX_ANGULAR_SPEED} rad/s"
-            )
-        if time <= 0.0:
-            raise ValueError("time must be positive")
-        if int(frame_type) not in (0, 1):
-            raise ValueError("frame_type must be 0 (tool) or 1 (work)")
-        dt_ms = max(1, int(round(time * 1000.0)))
-        mode, parameter = self._validate_stream_options(trajectory_mode, radio)
-        config = (int(bool(avoid_singularity)), int(frame_type), dt_ms)
-        if config != self._velocity_stream_config:
-            self._checked_call(
-                "rm_set_movev_canfd_init",
-                self._arm.rm_set_movev_canfd_init,
-                config[0],
-                config[1],
-                config[2],
-            )
-            self._velocity_stream_config = config
-        return self._checked_call(
-            "rm_movev_canfd",
-            self._arm.rm_movev_canfd,
-            velocity,
-            bool(high_follow),
-            mode,
-            parameter,
+        raise NotImplementedError(
+            "Cartesian velocity pass-through requires newer firmware. "
+            "Use servo_joint() or servo_tool() position targets on RM65-BI 1.4.x."
         )
 
     def servo_joint(
@@ -610,32 +602,29 @@ class RealmanControl:
         gain: int = 300,
         *,
         high_follow: bool = False,
-        trajectory_mode: int = 1,
-        radio: int = 50,
+        trajectory_mode: int = 0,
+        radio: int = 0,
     ) -> int:
         """Send one CAN-FD joint-position pass-through sample.
 
-        The caller owns timing; API2 does not consume ``speed``, ``acceleration``,
+        The caller owns timing; API 4.2.8 does not consume ``speed``, ``acceleration``,
         ``lookahead_time`` or ``gain``.  Set ``high_follow=True`` only when the
         caller can reliably keep the command period at or below 10 ms.
         """
 
         del speed, acceleration, lookahead_time, gain
-        if time <= 0.0:
+        if not math.isfinite(time) or time <= 0.0:
             raise ValueError("time must be positive")
         if high_follow and time > 0.010:
             raise ValueError("high-follow CAN-FD servoing requires time <= 0.010 s")
-        mode, parameter = self._validate_stream_options(trajectory_mode, radio)
+        self._validate_stream_options(trajectory_mode, radio)
         joints = self._joint_targets(joint_values)
         joint_degrees = [math.degrees(value) for value in joints]
         return self._checked_call(
-            "rm_movej_canfd",
-            self._arm.rm_movej_canfd,
+            "Movej_CANFD",
+            self._arm.Movej_CANFD,
             joint_degrees,
             bool(high_follow),
-            0.0,
-            mode,
-            parameter,
         )
 
     def servo_tool(
@@ -648,29 +637,27 @@ class RealmanControl:
         gain: int = 300,
         *,
         high_follow: bool = False,
-        trajectory_mode: int = 1,
-        radio: int = 50,
+        trajectory_mode: int = 0,
+        radio: int = 0,
     ) -> int:
         """Send one CAN-FD TCP-pose pass-through sample.
 
         This is the RM65-B equivalent used by ``VRTracker.track()``.  The input
         pose uses metres and a rotation vector, then is converted to the Euler
-        pose required by ``rm_movep_canfd``.
+        pose required by ``Movep_CANFD``.
         """
 
         del speed, acceleration, lookahead_time, gain
-        if time <= 0.0:
+        if not math.isfinite(time) or time <= 0.0:
             raise ValueError("time must be positive")
         if high_follow and time > 0.010:
             raise ValueError("high-follow CAN-FD servoing requires time <= 0.010 s")
-        mode, parameter = self._validate_stream_options(trajectory_mode, radio)
+        self._validate_stream_options(trajectory_mode, radio)
         return self._checked_call(
-            "rm_movep_canfd",
-            self._arm.rm_movep_canfd,
+            "Movep_CANFD",
+            self._arm.Movep_CANFD,
             self._to_realman_pose(pose),
             bool(high_follow),
-            mode,
-            parameter,
         )
 
     def stop(self, a: float = 2.0, asynchronous: bool = False) -> int:
@@ -678,7 +665,7 @@ class RealmanControl:
 
         del a, asynchronous
         return self._checked_call(
-            "rm_set_arm_slow_stop", self._arm.rm_set_arm_slow_stop
+            "Move_Slow_Stop_Cmd", self._arm.Move_Slow_Stop_Cmd
         )
 
     def close(self) -> int:
@@ -688,11 +675,11 @@ class RealmanControl:
             return 0
         self._closed = True
         return self._check_code(
-            self._arm.rm_delete_robot_arm(), "rm_delete_robot_arm"
+            self._arm.close(), "Arm_Socket_Close"
         )
 
     def stop_script(self) -> int:
-        """Compatibility cleanup: controlled stop, then disconnect API2."""
+        """Compatibility cleanup: controlled stop, then disconnect API 4.2.8."""
 
         if self._closed:
             return 0
@@ -726,4 +713,5 @@ class RealmanControl:
 
 
 # Short model-specific alias for callers that prefer the robot model name.
+RM65BI = RealmanControl
 RM65B = RealmanControl

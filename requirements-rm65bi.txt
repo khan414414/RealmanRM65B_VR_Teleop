@@ -1,0 +1,5 @@
+numpy
+scipy
+requests
+# Offline Algo safety checks only. Robot connections use the bundled API 4.2.8.
+Robotic_Arm==1.1.6

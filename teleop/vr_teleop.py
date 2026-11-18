@@ -2,10 +2,10 @@ import math
 import select
 import socket
 import time
-from dataclasses import dataclass
 from typing import Optional
 
 from teleop.gripper_request import GripperRequest
+from teleop.vr_protocol import INPUT_INVALID_PREFIX, ControllerSample, parse_controller_line
 from teleop.vr_calibration import (
     CalibrationError,
     ConsoleKeyReader,
@@ -15,49 +15,11 @@ from teleop.vr_calibration import (
     save_calibration_atomic,
 )
 from teleop.vr_tracker import TeleoperationSafetyWarning, VRTracker
-from Realman_Control.realman_control import RM65B
+from Realman_Control.realman_control import RM65BI
 
 
 ROBOT_COMMAND_RATE_HZ = 100.0
 MAX_FRESH_SAMPLE_AGE_S = 0.050
-
-
-@dataclass(frozen=True)
-class ControllerSample:
-    """One native Unity/XR frame, optionally carrying protocol-v2 timing."""
-
-    position: tuple[float, float, float]
-    rotation: tuple[float, float, float, float]
-    trigger_held: bool
-    sequence_id: Optional[int] = None
-    unity_time_s: Optional[float] = None
-
-
-def parse_controller_line(line):
-    """Parse a legacy 9-field or timestamped 11-field controller record."""
-
-    fields = line.strip().split(",")
-    if len(fields) not in (9, 11):
-        raise ValueError(
-            f"expected 9 or 11 controller fields, received {len(fields)}"
-        )
-    values = [float(field) for field in fields[:9]]
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("controller record contains a non-finite value")
-    sequence_id = None
-    unity_time_s = None
-    if len(fields) == 11:
-        sequence_id = int(fields[9])
-        unity_time_s = float(fields[10])
-        if sequence_id < 0 or not math.isfinite(unity_time_s) or unity_time_s < 0.0:
-            raise ValueError("controller timing fields are invalid")
-    return ControllerSample(
-        position=tuple(values[:3]),
-        rotation=tuple(values[3:7]),
-        trigger_held=bool(values[7]),
-        sequence_id=sequence_id,
-        unity_time_s=unity_time_s,
-    )
 
 
 class FixedRateScheduler:
@@ -198,6 +160,15 @@ def process_controller_sample(teleop, position, rotation, trigger_held):
     return None
 
 
+def reject_invalid_controller_input(teleop, calibrator):
+    """Discard a partial calibration and stop advancing the VR target."""
+    if not teleop.paused:
+        teleop.pause()
+    if calibrator.active:
+        return calibrator.cancel().message
+    return None
+
+
 def main():
     # Create a TCP socket to listen to Unity
     unity_ip = "127.0.0.1"
@@ -211,8 +182,9 @@ def main():
 
             # Initialize the teleoperation class
             # rtde = RTDE("192.168.1.102")
-            rtde = RM65B("192.168.1.18", port=8080)
+            rtde = RM65BI("192.168.1.18", port=8080)
             try:
+                print(f"Connected via RealMan API 4.2.8: {rtde.get_software_info()}")
                 gripper = GripperRequest("130.215.216.42")
                 calibration_path = default_calibration_path()
                 try:
@@ -340,6 +312,23 @@ def main():
                         records = receive_buffer.split(b"\n")
                         receive_buffer = records.pop()
                         for raw_record in records:
+                            if raw_record.startswith(INPUT_INVALID_PREFIX.encode("ascii")):
+                                latest_sample = None
+                                latest_sample_received_at = None
+                                latest_trigger_state = None
+                                tracking_requires_release = True
+                                calibration_waiting_for_release = False
+                                cancelled = reject_invalid_controller_input(teleop, calibrator)
+                                if cancelled is not None:
+                                    print(cancelled)
+                                    print("跟踪无效，本轮标定已取消；旧标定未改变。恢复跟踪后按 Q 重新标定。")
+                                warning_reporter.report(
+                                    "VR input rejected; release Trigger after restoring right Touch tracking: "
+                                    + raw_record.decode("ascii", errors="replace").strip()
+                                )
+                                continue
+                            if raw_record.startswith(b"#VR_DIAG "):
+                                continue
                             try:
                                 sample = parse_controller_line(
                                     raw_record.decode("ascii")
