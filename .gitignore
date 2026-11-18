@@ -20,3 +20,6 @@ __pycache__/
 # Runtime VR calibration (machine/room specific)
 config/vr_position_calibration.json
 config/vr_position_calibration.json.tmp
+
+# Local diagnostics, downloaded research files, and validation worktrees
+.log_analysis/

@@ -141,8 +141,20 @@ def solve_position_mapping(
 
     triple_product = float(np.linalg.det(directions))
     if triple_product < min_right_handed_triple_product:
+        if triple_product < 0.0:
+            explanation = (
+                "三轴方向组合构成左手系；请核对是否有轴正负方向取反，"
+                "或 +X/+Y/+Z 的采样顺序弄反。"
+            )
+        else:
+            explanation = "三轴右手性不足，请重新核对三轴方向。"
         raise CalibrationError(
-            "sampled axes are not a clear right-handed +X/+Y/+Z frame"
+            "sampled axes are not a clear right-handed +X/+Y/+Z frame; "
+            f"归一化三重积={triple_product:+.3f}，"
+            f"要求至少 +{min_right_handed_triple_product:.3f}。"
+            + explanation
+            + "以机器人基坐标为准，满足 +X×+Y=+Z；"
+            "例如 +X 向前、+Z 向上时，+Y 应向左。"
         )
     condition_number = float(np.linalg.cond(directions))
     if condition_number > max_condition_number:
@@ -322,7 +334,11 @@ class GuidedPositionCalibrator:
 
     def start(self) -> CalibrationUpdate:
         self._reset_sampling()
-        return CalibrationUpdate("VR 坐标标定已开始。" + self.prompt)
+        return CalibrationUpdate(
+            "VR 坐标标定已开始。正方向以机器人基坐标为准，满足 +X×+Y=+Z。"
+            "例如 +X 向前、+Z 向上时，+Y 应向左；每次都从同一原点出发。\n"
+            + self.prompt
+        )
 
     def request_capture(self) -> CalibrationUpdate:
         if not self.active:
