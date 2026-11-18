@@ -234,8 +234,9 @@ def main():
                     rate=1.0 / ROBOT_COMMAND_RATE_HZ,
                     #smooth_step=0.15,
                     smooth_step=1,
-                    # 1:1 distance; flip horizontal axes to match the operator's
-                    # forward/left directions with the RM65 base frame.
+                    # The calibration matrix preserves distance and sets only
+                    # direction. VRTracker currently applies a separate 1.5x
+                    # translation gain before its workspace projection.
                     pos_mapping=position_mapping,
                     # Calibrated so the RM65 wrist follows the operator's turn.
                     wrist_roll_axis=(1.0, 0.0, 0.0),
