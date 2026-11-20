@@ -28,5 +28,6 @@ The bundled library supports 64-bit Windows Python. Other platforms require a
 separate, matching manufacturer library and ABI verification.
 
 API2 (`Robotic_Arm==1.1.6`) is retained exclusively for the offline `Algo` class:
-predictive singularity and self-collision checks are absent from API 4.2.8.
+it supplies official IK/FK and predictive singularity/self-collision checks.
+Controller communication continues to use API 4.2.8.
 No `RoboticArm`, `rm_init`, or `rm_create_robot_arm` call is used on this branch.

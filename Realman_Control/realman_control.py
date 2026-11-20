@@ -11,7 +11,7 @@ RealMan API 4.2.8 uses joint degrees and XYZ Euler angles.  This module performs
 conversion at the boundary.  Planned moves use RealMan's percentage speed,
 while online joint/pose servoing uses the CAN-FD pass-through interfaces.
 
-API2 is used only through its offline Algo class for predictive safety checks.
+API2 is used through its offline Algo class for kinematics and safety checks.
 All controller communication goes through the legacy SDK; see vendor/README.md.
 """
 
@@ -115,12 +115,12 @@ class RealmanControl:
         return info
 
     def _safety_algo(self):
-        """Create an offline RM65-B algorithm instance; never open an API2 socket."""
+        """Create official offline kinematics/safety; never open an API2 socket."""
 
         if self._algo is None:
             if _rm is None:
                 raise RuntimeError(
-                    "Predictive safety checks require Robotic_Arm==1.1.6 "
+                    "Official IK/FK and safety checks require Robotic_Arm==1.1.6 "
                     "(offline Algo only). Install requirements-rm65bi.txt."
                 ) from _SDK_IMPORT_ERROR
             if self._tool_frame is None:
@@ -129,9 +129,34 @@ class RealmanControl:
                 _rm.rm_robot_arm_model_e.RM_MODEL_RM_65_E,
                 _rm.rm_force_type_e.RM_MODEL_RM_B_E,
             )
+            # Teleoperation targets use the robot base frame, not a user work frame.
+            self._algo.rm_algo_set_workframe(_rm.rm_frame_t("Base", [0.0] * 6, 0, 0, 0, 0))
             self._sync_safety_limits()
             self._sync_safety_tool()
         return self._algo
+
+    def official_forward_kinematics(self, joints_rad):
+        """Official offline FK: radians in; base TCP metres + Euler radians out."""
+        joints = self._joint_targets(joints_rad)
+        pose = self._safety_algo().rm_algo_forward_kinematics(
+            [math.degrees(q) for q in joints], flag=1
+        )
+        return self._vector(pose, 6, "official FK pose")
+
+    def official_inverse_kinematics(self, seed_rad, pose_euler):
+        """Official full-pose IK; keep the SDK code and never send a command."""
+        seed = self._joint_targets(seed_rad)
+        pose = self._vector(pose_euler, 6, "official IK pose")
+        algo = self._safety_algo()
+        params = _rm.rm_inverse_kinematics_params_t(
+            [math.degrees(q) for q in seed], pose, 1
+        )
+        code, joints_deg = algo.rm_algo_inverse_kinematics(params)
+        # Failed SDK output is undefined. Do not consume zeros/NaNs as a solution.
+        if int(code) != 0:
+            return int(code), None
+        joints = self._vector(list(joints_deg)[:6], 6, "official IK joints")
+        return 0, [math.radians(q) for q in joints]
 
     def _sync_safety_tool(self):
         if self._algo is not None and self._tool_frame is not None:
@@ -642,7 +667,7 @@ class RealmanControl:
     ) -> int:
         """Send one CAN-FD TCP-pose pass-through sample.
 
-        This is the RM65-B equivalent used by ``VRTracker.track()``.  The input
+        This optional full-pose interface is not used by ``VRTracker.track()``. The input
         pose uses metres and a rotation vector, then is converted to the Euler
         pose required by ``Movep_CANFD``.
         """

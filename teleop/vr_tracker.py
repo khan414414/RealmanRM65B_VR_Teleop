@@ -8,6 +8,7 @@ from collections import deque
 from typing import Optional, Sequence
 
 import numpy as np
+from teleop.official_position_ik import OfficialPositionIK
 
 from teleop.rm65_decoupled_ik import (
     ContinuousControllerTwist,
@@ -22,6 +23,10 @@ from teleop.rm65_decoupled_ik import (
 
 class TeleoperationSafetyWarning(RuntimeError):
     """Tracking could not advance without requesting a robot stop."""
+
+
+class KinematicSafetyError(ValueError):
+    """An actual joint/singularity/collision rejection, not numerical IK noise."""
 
 
 class VRTracker:
@@ -39,6 +44,7 @@ class VRTracker:
         smooth_step: float = 0.1,
         pos_mapping: Sequence[float] = (1.0, 1.0, 1.0),
         *,
+        wrist_smooth_step: float = 1.0,
         wrist_roll_axis: Sequence[float] = (1.0, 0.0, 0.0),
         wrist_roll_sign: float = 1.0,
         wrist_roll_gain: float = 1.0,
@@ -52,12 +58,14 @@ class VRTracker:
         max_following_error_rad: float = math.radians(10.0),
         following_error_check_period_s: float = 0.1,
         following_error_settle_time_s: float = 0.15,
-        ik_solver: Optional[RM65DecoupledIK] = None,
+        ik_solver: Optional[RM65DecoupledIK | OfficialPositionIK] = None,
+        ik_solver_factory=OfficialPositionIK,
     ) -> None:
         self.rtde = rtde
         self.gripper = gripper
         self.rate = float(rate)
         self.smooth_step = float(smooth_step)
+        self.wrist_smooth_step = float(wrist_smooth_step)
         self._position_mapping_matrix = self._mapping_matrix(pos_mapping)
         self.wrist_roll_sign = float(wrist_roll_sign)
         self.wrist_roll_gain = float(wrist_roll_gain)
@@ -80,6 +88,8 @@ class VRTracker:
             raise ValueError("rate must be positive")
         if not 0.0 < self.smooth_step <= 1.0:
             raise ValueError("smooth_step must be in (0, 1]")
+        if not 0.0 < self.wrist_smooth_step <= 1.0:
+            raise ValueError("wrist_smooth_step must be in (0, 1]")
         if self.wrist_roll_sign not in (-1.0, 1.0):
             raise ValueError("wrist_roll_sign must be +1 or -1")
         if not 0.0 < self.safety_approach_scale < 1.0:
@@ -116,11 +126,12 @@ class VRTracker:
             get_tool_frame = getattr(rtde, "get_active_tool_frame_pose_euler", None)
             if get_tool_frame is not None:
                 tcp_transform = transform_from_xyz_euler(get_tool_frame())
-            ik_solver = RM65DecoupledIK(
+            ik_solver = ik_solver_factory(
+                rtde,
                 tcp_transform=tcp_transform,
                 joint_limits_rad=joint_limits,
                 options=IKOptions(
-                    position_tolerance_m=2.0e-4,
+                    position_tolerance_m=2.0e-5,
                     max_solution_delta_rad=self._maximum_joint_step,
                     max_wrist_step_rad=self._maximum_joint_step,
                     joint_limit_margin_rad=self.joint_limit_margin_rad,
@@ -139,6 +150,11 @@ class VRTracker:
         ):
             raise ValueError("joint safety margins leave no usable joint range")
         self._safe_joint_limits_rad = np.column_stack((safe_lower, safe_upper))
+        if isinstance(self.ik, OfficialPositionIK):
+            self.ik.candidate_validator = self._check_kinematic_candidate
+            # A soft compute budget leaves time for FK/safety and transmission;
+            # use an already checked partial step when the search runs out.
+            self.ik.max_solve_time_s = 0.6 * self.rate
         self.twist = ContinuousControllerTwist(axis=wrist_roll_axis)
 
         self.paused = True
@@ -149,6 +165,8 @@ class VRTracker:
         self.target_position: Optional[np.ndarray] = None
         self.requested_position: Optional[np.ndarray] = None
         self.requested_wrist: Optional[float] = None
+        self._blocked_translation_bias = np.zeros(3, dtype=np.float64)
+        self._blocked_wrist_bias = 0.0
         self.joint_anchor: Optional[np.ndarray] = None
         self.command_joints: Optional[np.ndarray] = None
         self._next_following_error_check_at: Optional[float] = None
@@ -196,6 +214,26 @@ class VRTracker:
         self.last_warning_reason = reason
         return TeleoperationSafetyWarning(reason)
 
+    def _forward_kinematics(self, joints):
+        """Use official FK for the official solver, including rate-limit checks."""
+        official_fk = getattr(self.ik, "forward_kinematics", None)
+        if callable(official_fk):
+            return official_fk(joints)
+        # Explicitly injected legacy solvers remain available for offline tests.
+        return forward_kinematics(joints, self.ik.tcp_transform)
+
+    def _discard_blocked_offset(self):
+        """Anti-windup: discard rejected intent, retaining the original workspace.
+
+        A subsequent inward hand motion starts at the last safe command rather
+        than having to undo an unreachable accumulated offset or re-press Trigger.
+        This never relaxes a singularity, collision, joint, or feedback check.
+        """
+        self._blocked_translation_bias += self.target_position - self.requested_position
+        self._blocked_wrist_bias += float(self.command_joints[5]) - self.requested_wrist
+        self.requested_position = self.target_position.copy()
+        self.requested_wrist = float(self.command_joints[5])
+
     @property
     def safe_joint_limits_rad(self) -> np.ndarray:
         """Return the teach-pendant limits after reserving safety margins."""
@@ -235,6 +273,10 @@ class VRTracker:
         if validate is not None:
             validate(joints, singular_value_limit=self.singular_value_limit)
 
+    def _check_kinematic_candidate(self, joints):
+        self._joint_margin_check(joints)
+        self._model_singularity_check(joints)
+
     def _capture_requested_target(self, controller: np.ndarray) -> bool:
         """Store the newest finite controller intent; newer frames replace it.
 
@@ -256,6 +298,7 @@ class VRTracker:
                 controller[:3] - self.input_anchor[:3]
             )
         )
+        relative_translation += self._blocked_translation_bias
         translation_norm = float(np.linalg.norm(relative_translation))
         workspace_limited = translation_norm > self.max_position_offset_m
         if workspace_limited:
@@ -270,6 +313,7 @@ class VRTracker:
         requested_wrist = (
             self.joint_anchor[5]
             + self.wrist_roll_sign * self.wrist_roll_gain * controller_twist
+            + self._blocked_wrist_bias
         )
         requested_wrist = float(np.clip(requested_wrist, *safe_wrist_limits))
 
@@ -309,9 +353,7 @@ class VRTracker:
 
         delta = np.asarray(joints, dtype=np.float64) - self.command_joints
         candidate = self.command_joints + delta
-        candidate_position = forward_kinematics(
-            candidate, self.ik.tcp_transform
-        )[:3, 3]
+        candidate_position = self._forward_kinematics(candidate)[:3, 3]
         displacement = float(
             np.linalg.norm(candidate_position - self.target_position)
         )
@@ -322,18 +364,19 @@ class VRTracker:
         # The joint delta is already at most one normal command step.  Local
         # FK is therefore smooth enough for conservative ratio backoff; repeat
         # in case its Cartesian response is not perfectly linear.
-        scale = maximum / displacement
+        # Official FK is float32. Back off inside the hard limit by up to 1 um
+        # instead of repeatedly requesting sub-ULP changes and falsely failing.
+        conservative_maximum = maximum - min(1e-6, 0.05 * maximum)
+        scale = conservative_maximum / displacement
         for _ in range(12):
             candidate = self.command_joints + scale * delta
-            candidate_position = forward_kinematics(
-                candidate, self.ik.tcp_transform
-            )[:3, 3]
+            candidate_position = self._forward_kinematics(candidate)[:3, 3]
             displacement = float(
                 np.linalg.norm(candidate_position - self.target_position)
             )
             if displacement <= maximum + tolerance:
                 return candidate, candidate_position, True
-            scale *= 0.999999 * maximum / displacement
+            scale *= conservative_maximum / displacement
         raise ValueError("candidate could not satisfy the Cartesian speed limit")
 
     def _candidate_makes_progress(
@@ -414,9 +457,7 @@ class VRTracker:
         if self.command_joints is None:
             raise ValueError("joint command anchor is not initialized")
         delta = candidate - self.command_joints
-        full_position = forward_kinematics(
-            candidate, self.ik.tcp_transform
-        )[:3, 3]
+        full_position = self._forward_kinematics(candidate)[:3, 3]
         if not self._candidate_makes_progress(
             candidate, full_position, planned_position
         ):
@@ -440,12 +481,12 @@ class VRTracker:
             if not self._candidate_makes_progress(
                 slow_candidate, slow_position, planned_position
             ):
-                raise ValueError(str(full_error)) from full_error
+                raise KinematicSafetyError(str(full_error)) from full_error
             try:
                 self._joint_margin_check(slow_candidate)
                 self._model_singularity_check(slow_candidate)
             except ValueError as slow_error:
-                raise ValueError(str(slow_error)) from slow_error
+                raise KinematicSafetyError(str(slow_error)) from slow_error
             return slow_candidate, slow_position, self.safety_approach_scale
         return candidate, full_position, 1.0
 
@@ -569,15 +610,17 @@ class VRTracker:
             self._joint_margin_check(joints)
             self._model_singularity_check(joints)
 
-            tcp_position = forward_kinematics(
-                joints, self.ik.tcp_transform
-            )[:3, 3]
+            tcp_position = self._forward_kinematics(joints)[:3, 3]
+            if isinstance(self.ik, OfficialPositionIK):
+                self.ik.reset_continuity()
             self.twist.reset(controller[3:])
             self.input_anchor = controller
             self.tool_anchor_position = tcp_position.copy()
             self.target_position = tcp_position.copy()
             self.requested_position = tcp_position.copy()
             self.requested_wrist = float(joints[5])
+            self._blocked_translation_bias = np.zeros(3, dtype=np.float64)
+            self._blocked_wrist_bias = 0.0
             self.joint_anchor = joints.copy()
             self.command_joints = joints.copy()
             now = time.monotonic()
@@ -681,7 +724,8 @@ class VRTracker:
             result = self.ik.solve(
                 next_target_position,
                 self.command_joints,
-                wrist_joint_6_target_rad=requested_wrist,
+                wrist_joint_6_target_rad=(self.command_joints[5] + self.wrist_smooth_step
+                                         * (requested_wrist - self.command_joints[5])),
                 posture_reference_rad=self.joint_anchor,
             )
             candidate, joint_limited = self._rate_limit_joint_target(
@@ -734,9 +778,17 @@ class VRTracker:
             )
             return candidate.copy()
         except (ValueError, np.linalg.LinAlgError) as exc:
+            if isinstance(exc, KinematicSafetyError):
+                self._discard_blocked_offset()
+                recovery = ("; rejected offset discarded, move the controller away "
+                            "from the boundary without releasing Trigger")
+            else:
+                # A transient SDK/progress/rounding failure is not proof of a
+                # physical boundary. Keep the latest intent for the next tick.
+                recovery = "; latest target retained for retry"
             raise self._warning(
                 "latest tracking target retained at the last safe command: "
-                f"{exc}"
+                f"{exc}{recovery}"
             ) from exc
 
     def trigger_gripper(self) -> None:

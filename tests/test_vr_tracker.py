@@ -8,6 +8,7 @@ import numpy as np
 from teleop.rm65_decoupled_ik import (
     RM65_JOINT_LIMITS_RAD,
     RM65_NOMINAL_POSTURE_RAD,
+    RM65DecoupledIK,
     forward_kinematics,
 )
 from teleop.vr_teleop import (
@@ -85,6 +86,9 @@ class VRTrackerTests(unittest.TestCase):
             smooth_step=0.15,
             pos_mapping=(-1.0, -1.0, 1.0),
             wrist_roll_sign=1.0,
+            # Isolate existing tracker tests from the official DLL. Separate
+            # integration tests exercise the production official-IK default.
+            ik_solver_factory=lambda backend, **kw: RM65DecoupledIK(**kw),
         )
         self.anchor = np.asarray((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0))
         self.tracker.resume(self.anchor)
@@ -513,14 +517,105 @@ class VRTrackerTests(unittest.TestCase):
         self.assertEqual(self.robot.commands, [])
         np.testing.assert_allclose(self.tracker.target_position, target_before)
         self.assertIsNotNone(self.tracker.requested_position)
-        retained = self.tracker.requested_position.copy()
 
+        retained = self.tracker.requested_position.copy()
         self.tracker._model_singularity_check = lambda joints: None
         command = self.tracker.track(controller)
-
         self.assertIsNotNone(command)
         self.assertEqual(len(self.robot.commands), 1)
         np.testing.assert_allclose(self.tracker.requested_position, retained)
+
+    def test_rejected_offset_does_not_require_trigger_to_retreat(self):
+        start_position = self.tracker.target_position.copy()
+        start_joints = self.tracker.command_joints.copy()
+        original_check = self.tracker._model_singularity_check
+
+        def blocked(joints):
+            raise ValueError("joint target is near a shoulder singularity")
+
+        self.tracker._model_singularity_check = blocked
+        outward = self.anchor.copy()
+        outward[0] = -0.05
+        with self.assertRaises(TeleoperationSafetyWarning):
+            self.tracker.track(outward)
+        self.assertFalse(self.tracker.paused)
+        np.testing.assert_allclose(self.tracker.requested_position, start_position)
+        np.testing.assert_array_equal(self.tracker.command_joints, start_joints)
+        self.assertEqual(self.robot.commands, [])
+
+        # Once a safe inward candidate is available, a small inward hand motion
+        # takes effect immediately without releasing/re-pressing Trigger.
+        self.tracker._model_singularity_check = original_check
+        inward = outward.copy()
+        inward[0] += 0.002
+        command = self.tracker.track(inward)
+        self.assertFalse(self.tracker.paused)
+        self.assertLess(self.tracker.target_position[0], start_position[0])
+        self.assertLessEqual(np.max(np.abs(command - start_joints)),
+                             self.tracker._maximum_joint_step + 1e-12)
+        self.assertEqual(self.robot.stop_calls, 0)
+
+    def test_transient_numerical_failure_retains_intent_without_reanchoring(self):
+        hand = self.anchor.copy()
+        hand[0] = 0.01
+        original = self.tracker._rate_limit_cartesian_target
+        self.tracker._rate_limit_cartesian_target = (
+            lambda *args: (_ for _ in ()).throw(ValueError("temporary FK rounding")))
+        with self.assertRaisesRegex(TeleoperationSafetyWarning, "retained for retry"):
+            self.tracker.track(hand)
+        requested = self.tracker.requested_position.copy()
+        np.testing.assert_array_equal(self.tracker._blocked_translation_bias, 0)
+        self.tracker._rate_limit_cartesian_target = original
+        self.tracker.track(hand)
+        np.testing.assert_array_equal(self.tracker.requested_position, requested)
+        self.assertEqual(len(self.robot.commands), 1)
+
+    def test_float32_fk_backoff_stays_inside_cartesian_limit(self):
+        self.tracker.command_joints = np.zeros(6)
+        self.tracker.target_position = np.array([1.0, 0.0, 0.0])
+
+        def rounded_fk(q):
+            transform = np.eye(4)
+            transform[0, 3] = np.float32(1.0 + q[0])
+            return transform
+
+        self.tracker._forward_kinematics = rounded_fk
+        candidate = np.zeros(6)
+        candidate[0] = 0.001
+        maximum = float(np.float32(1.0001)) - 1.0 - 1e-10
+        joints, position, limited = self.tracker._rate_limit_cartesian_target(candidate, maximum)
+        self.assertTrue(limited)
+        self.assertGreater(joints[0], 0)
+        self.assertLessEqual(np.linalg.norm(position - self.tracker.target_position), maximum)
+
+    def test_wrist_smoothing_preserves_independence_and_joint_step_limit(self):
+        self.tracker.wrist_smooth_step = 0.15
+        hand = self.anchor.copy()
+        hand[3:] = self.mapped_axis_quaternion((1, 0, 0), 10)
+        start = self.tracker.command_joints.copy()
+        command = self.tracker.track(hand)
+        self.assertAlmostEqual(command[5] - start[5], math.radians(1.5), places=10)
+        self.assertLessEqual(np.max(np.abs(command - start)),
+                             self.tracker._maximum_joint_step + 1e-12)
+
+    def test_anti_windup_keeps_original_workspace_and_does_not_disable_checks(self):
+        original_workspace_center = self.tracker.tool_anchor_position.copy()
+
+        def blocked(joints):
+            raise ValueError("unsafe candidate")
+
+        self.tracker._model_singularity_check = blocked
+        for displacement in (-0.05, -0.20, -0.40, -0.70):
+            hand = self.anchor.copy()
+            hand[0] = displacement
+            with self.assertRaises(TeleoperationSafetyWarning):
+                self.tracker.track(hand)
+            np.testing.assert_array_equal(self.tracker.tool_anchor_position,
+                                          original_workspace_center)
+            self.assertLessEqual(np.linalg.norm(self.tracker.requested_position
+                                               - original_workspace_center),
+                                 self.tracker.max_position_offset_m + 1e-12)
+        self.assertEqual(self.robot.commands, [])
 
     def test_following_error_is_time_aligned_then_catches_up_with_keepalive(self):
         clock = FakeClock()
@@ -534,6 +629,7 @@ class VRTrackerTests(unittest.TestCase):
                 max_following_error_rad=math.radians(0.1),
                 following_error_check_period_s=0.005,
                 following_error_settle_time_s=0.015,
+                ik_solver_factory=lambda backend, **kw: RM65DecoupledIK(**kw),
             )
             tracker.resume(self.anchor)
             q0 = robot.joints.copy()
